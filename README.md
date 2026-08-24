@@ -6,8 +6,9 @@ Automated hardening scripts for a fresh Ubuntu server deployed in a DMZ (demilit
 
 | Script | Purpose |
 |---|---|
-| `01-initial-setup.sh` | Run once after installation. Creates the admin user, restricts sudo, hardens SSH, configures the firewall, sets up automatic security updates, and applies kernel hardening. |
+| `01-initial-setup.sh` | Run once after installation. Creates the admin user, restricts sudo, hardens SSH, configures the firewall, sets up automatic security updates, applies kernel hardening, and configures a login banner. |
 | `02-add-service.sh` | Run any time you add a new service. Interactively opens only the required ports and applies service-specific hardening. |
+| `03-verify-hardening.sh` | Run at any time to audit whether all hardening from `01-initial-setup.sh` is still in effect. Prints a pass/fail report and exits non-zero if any check fails. |
 
 ---
 
@@ -40,6 +41,7 @@ Automated hardening scripts for a fresh Ubuntu server deployed in a DMZ (demilit
 8. Installs `fail2ban` — SSH bans: 3 retries → 24 h, doubling on repeat, max 7 days
 9. Applies kernel hardening (`/etc/sysctl.d/99-dmz-hardening.conf`): disables IP forwarding, ICMP redirects, source routing; enables SYN cookies, reverse-path filtering, ASLR, and more
 10. Installs `auditd` with rules for privilege escalation, SSH events, and sudoers changes
+11. Configures a login banner (`/etc/issue`) that displays the server's local and WAN IP on every boot via a `systemd` one-shot service
 
 ### How to run
 
@@ -78,9 +80,10 @@ sudo bash 02-add-service.sh
 |---|---|
 | Web server (nginx) | Opens 80 + 443; installs nginx; applies security headers, TLS hardening, and rate limiting; adds fail2ban jails; sets up Certbot |
 | Reverse proxy (nginx) | Same as above; writes a hardened `proxy_pass` template for your app |
-| FastAPI / Python API (uvicorn) | Opens a custom port; optional source IP restriction; adds a fail2ban jail |
+| FastAPI / Python API (uvicorn) | Opens a custom port; applies UFW rate-limiting (`ufw limit`); adds a fail2ban jail with a journal-backed uvicorn filter |
 | PostgreSQL | Locks to loopback (recommended) or opens 5432 with source IP restriction |
 | MySQL / MariaDB | Locks to loopback (recommended) or opens 3306 with source IP restriction |
+| Redis | Locks to loopback (recommended) with password and dangerous-command hardening, or opens 6379 with source IP restriction |
 | Custom port | Opens any port/protocol with an optional source IP restriction |
 
 ---
@@ -106,7 +109,17 @@ All other inbound and outbound traffic is **denied by default**.
 
 ## Verifying the hardening
 
-After the initial setup and a reboot, run these checks as your new admin user:
+The easiest way to verify all hardening is still in place is to run the dedicated audit script:
+
+```bash
+sudo bash 03-verify-hardening.sh
+```
+
+It runs every check listed below automatically, prints a coloured pass/fail report, and exits with code `1` if anything is wrong.
+
+### Manual checks
+
+If you prefer to run individual checks:
 
 ```bash
 # Confirm only your admin user is in the sudo group

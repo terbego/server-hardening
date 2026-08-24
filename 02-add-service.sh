@@ -188,27 +188,49 @@ setup_python_api() {
     read -r -p "  Port your FastAPI/uvicorn app listens on [8000]: " API_PORT
     API_PORT="${API_PORT:-8000}"
 
-    read -r -p "  App name (used for comments/labels) [trading-api]: " APP_NAME
+    read -r -p "  App name / systemd service name (used for labels) [trading-api]: " APP_NAME
     APP_NAME="${APP_NAME:-trading-api}"
 
     prompt_source_ip
-    open_port tcp "${API_PORT}" "${APP_NAME}"
 
-    # ── fail2ban rate-limiting jail ──
-    # There is no built-in filter for uvicorn; we use a generic TCP one.
+    # Use 'ufw limit' to rate-limit the port (blocks IPs with >6 new connections
+    # in 30 seconds via the iptables recent module) in addition to opening it.
+    if [[ -n "${SOURCE_IP:-}" ]]; then
+        ufw allow from "${SOURCE_IP}" to any port "${API_PORT}" proto tcp comment "${APP_NAME}"
+    else
+        ufw limit "${API_PORT}/tcp" comment "${APP_NAME}"
+    fi
+
+    # ── fail2ban jail backed by the systemd journal ──
+    # Requires the app to run as a systemd unit named <APP_NAME>.service.
+    # The filter parses 4xx/5xx lines from the uvicorn access log written to the
+    # journal; adjust journalmatch if your service unit name differs.
     add_fail2ban_jail "${APP_NAME}" "
 [${APP_NAME}]
-enabled  = true
-port     = ${API_PORT}
-filter   = sshd
-maxretry = 20
-findtime = 1m
-bantime  = 30m
+enabled      = true
+port         = ${API_PORT}
+backend      = systemd
+journalmatch = _SYSTEMD_UNIT=${APP_NAME}.service
+filter       = ${APP_NAME}
+maxretry     = 20
+findtime     = 1m
+bantime      = 30m
+action       = iptables-multiport[name=${APP_NAME}, port=${API_PORT}, protocol=tcp]
 "
 
-    success "Port ${API_PORT} opened for '${APP_NAME}'."
-    warn "If uvicorn is not already running as a systemd service, consider:"
+    # Write a minimal fail2ban filter that matches uvicorn's access-log format.
+    # Uvicorn logs: INFO:     <ip>:<port> - "METHOD /path HTTP/1.1" <status>
+    cat > "/etc/fail2ban/filter.d/${APP_NAME}.conf" << EOF
+[Definition]
+failregex = ^INFO:\s+<HOST>:\d+ - "(?:GET|POST|PUT|DELETE|PATCH|HEAD|OPTIONS) .+ HTTP/\d\.\d" (?:4[0-9]{2}|5[0-9]{2}) \d+$
+ignoreregex =
+EOF
+
+    success "Port ${API_PORT} opened and rate-limited for '${APP_NAME}'."
+    warn "If uvicorn is not already running as a systemd service, create one:"
     echo "    sudo nano /etc/systemd/system/${APP_NAME}.service"
+    echo "  The fail2ban jail targets _SYSTEMD_UNIT=${APP_NAME}.service — update"
+    echo "  /etc/fail2ban/jail.d/${APP_NAME}.conf if your unit name differs."
 }
 
 setup_postgres() {
@@ -291,6 +313,80 @@ bantime  = 1h
     success "Port 3306 opened."
 }
 
+setup_redis() {
+    echo ""
+    echo "  Redis is best kept on the loopback interface for a DMZ server."
+    echo "  Only open port 6379 if a remote host must connect directly."
+    echo ""
+    read -r -p "  Open port 6379 externally? [y/N]: " open_redis
+    if [[ "${open_redis,,}" != "y" ]]; then
+        info "Redis stays on loopback — no UFW rule needed."
+        info "Installing Redis and locking it to 127.0.0.1..."
+        apt-get install -y -qq redis-server
+
+        REDIS_CONF="/etc/redis/redis.conf"
+        if [[ -f "${REDIS_CONF}" ]]; then
+            # Bind to loopback only
+            sed -i 's/^bind .*/bind 127.0.0.1 -::1/' "${REDIS_CONF}"
+            # Disable protected-mode warning (bind already restricts access)
+            sed -i 's/^protected-mode .*/protected-mode yes/' "${REDIS_CONF}"
+
+            # Prompt for a Redis password (requirepass)
+            echo ""
+            read -r -p "  Set a Redis password? (strongly recommended) [y/N]: " set_pass
+            if [[ "${set_pass,,}" == "y" ]]; then
+                read -r -s -p "  Redis password: " REDIS_PASS
+                echo ""
+                if [[ -n "${REDIS_PASS}" ]]; then
+                    # Remove any existing requirepass line, then append
+                    sed -i '/^requirepass /d' "${REDIS_CONF}"
+                    echo "requirepass ${REDIS_PASS}" >> "${REDIS_CONF}"
+                    success "Redis password set."
+                else
+                    warn "Empty password entered — skipping requirepass."
+                fi
+            fi
+
+            # Disable dangerous commands
+            cat >> "${REDIS_CONF}" << 'REDIS_HARDENING'
+
+# Hardening — disable commands that can overwrite files or crash the server.
+rename-command FLUSHALL ""
+rename-command FLUSHDB  ""
+rename-command DEBUG    ""
+rename-command CONFIG   ""
+rename-command SHUTDOWN SHUTDOWN_RESTRICTED
+REDIS_HARDENING
+
+            systemctl enable redis-server
+            systemctl restart redis-server
+            success "Redis configured to listen on localhost only with hardening applied."
+        else
+            warn "Redis config not found at ${REDIS_CONF}. Install redis-server manually."
+        fi
+        return
+    fi
+
+    prompt_source_ip
+    if [[ -z "${SOURCE_IP:-}" ]]; then
+        warn "Exposing Redis to 0.0.0.0 is strongly discouraged in a DMZ."
+        read -r -p "  Are you sure? [y/N]: " really
+        [[ "${really,,}" == "y" ]] || { info "Skipping Redis external exposure."; return; }
+    fi
+    open_port tcp 6379 "Redis"
+
+    add_fail2ban_jail "redis" "
+[redis]
+enabled  = true
+port     = 6379
+filter   = redis-auth
+maxretry = 5
+bantime  = 1h
+"
+    success "Port 6379 opened."
+    warn "Ensure Redis has 'requirepass' set and 'bind' includes only trusted interfaces."
+}
+
 setup_custom_port() {
     echo ""
     read -r -p "  Port number: " CUSTOM_PORT
@@ -328,14 +424,15 @@ while true; do
     echo -e "${CYAN}What service do you want to add?${NC}"
     echo "  1) Web server (nginx)                  — opens 80, 443; hardens nginx; configures Certbot"
     echo "  2) Reverse proxy (nginx)               — same as above; adds proxy_pass template for your app"
-    echo "  3) FastAPI / Python API (uvicorn)      — opens a custom port; adds fail2ban jail"
+    echo "  3) FastAPI / Python API (uvicorn)      — opens a custom port; rate-limits; adds fail2ban jail"
     echo "  4) PostgreSQL                          — locks to loopback (recommended) or opens 5432"
     echo "  5) MySQL / MariaDB                     — locks to loopback (recommended) or opens 3306"
-    echo "  6) Custom port                         — opens any port/protocol with optional source IP"
-    echo "  7) Show current UFW rules"
-    echo "  8) Exit"
+    echo "  6) Redis                               — locks to loopback (recommended) or opens 6379"
+    echo "  7) Custom port                         — opens any port/protocol with optional source IP"
+    echo "  8) Show current UFW rules"
+    echo "  9) Exit"
     echo ""
-    read -r -p "Choice [1-8]: " CHOICE
+    read -r -p "Choice [1-9]: " CHOICE
 
     case "${CHOICE}" in
         1) setup_nginx "webserver"   ; reload_ufw ;;
@@ -343,10 +440,11 @@ while true; do
         3) setup_python_api          ; reload_ufw ;;
         4) setup_postgres                         ;;
         5) setup_mysql                            ;;
-        6) setup_custom_port         ; reload_ufw ;;
-        7) ufw status numbered ;;
-        8) echo "Done."; exit 0 ;;
-        *) warn "Invalid choice. Enter a number between 1 and 8." ;;
+        6) setup_redis                            ;;
+        7) setup_custom_port         ; reload_ufw ;;
+        8) ufw status numbered ;;
+        9) echo "Done."; exit 0 ;;
+        *) warn "Invalid choice. Enter a number between 1 and 9." ;;
     esac
 
     echo ""

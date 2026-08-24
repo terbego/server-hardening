@@ -455,12 +455,12 @@ systemctl restart auditd
 
 success "auditd installed and configured."
 
-python3 - << 'PYEOF'
-banner = r"""
+
 # ─────────────────────────────────────────────────────────────────────────────
 # 11. LOGIN BANNER — display local and WAN IP at console login prompt
 # ─────────────────────────────────────────────────────────────────────────────
 info "Configuring login banner with IP addresses..."
+
 cat > /usr/local/bin/update-issue << 'BANNER_SCRIPT'
 #!/usr/bin/env bash
 LOCAL_IP=$(ip -4 route get 8.8.8.8 2>/dev/null | awk '{print $7; exit}')
@@ -473,38 +473,32 @@ Ubuntu \n \l
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 EOF
 BANNER_SCRIPT
+
 chmod +x /usr/local/bin/update-issue
+
 cat > /etc/systemd/system/update-issue.service << 'EOF'
 [Unit]
 Description=Update login banner with local and WAN IP addresses
 After=network-online.target
 Wants=network-online.target
+
 [Service]
 Type=oneshot
 ExecStart=/usr/local/bin/update-issue
 RemainAfterExit=yes
+
 [Install]
 WantedBy=multi-user.target
 EOF
+
 systemctl daemon-reload
 systemctl enable update-issue
 /usr/local/bin/update-issue
+
 success "Login banner configured (/etc/issue updated on every boot)."
-"""
-with open("01-initial-setup.sh", "r") as f:
-    content = f.read()
-marker = 'success "auditd installed and configured."'
-if "update-issue" not in content:
-    content = content.replace(marker, marker + "\n" + banner)
-    with open("01-initial-setup.sh", "w") as f:
-        f.write(content)
-    print("Login banner section inserted.")
-else:
-    print("Already present — no changes needed.")
-PYEOF
 
 # ─────────────────────────────────────────────────────────────────────────────
-# 11. SUMMARY + REBOOT PROMPT
+# 12. SUMMARY + REBOOT PROMPT
 # ─────────────────────────────────────────────────────────────────────────────
 echo ""
 echo -e "${GREEN}============================================================${NC}"
@@ -516,12 +510,13 @@ echo -e "  ${GREEN}✓${NC} User '${TARGET_USER}' created with SSH keys"
 echo -e "  ${GREEN}✓${NC} sudo restricted to '${TARGET_USER}' only"
 [[ "${INSTALLER_USER}" != "${TARGET_USER}" ]] && \
     echo -e "  ${GREEN}✓${NC} Account '${INSTALLER_USER}' locked"
-echo -e "  ${GREEN}✓${NC} SSH: key-only, AllowUsers yasin, MaxAuthTries 3, MaxStartups 3:50:10"
+echo -e "  ${GREEN}✓${NC} SSH: key-only, AllowUsers ${TARGET_USER}, MaxAuthTries 3, MaxStartups 3:50:10"
 echo -e "  ${GREEN}✓${NC} UFW: deny all in/out; allow in: SSH 22; allow out: DNS/HTTP/HTTPS/NTP"
 echo -e "  ${GREEN}✓${NC} Automatic security updates (auto-reboot at 02:00)"
 echo -e "  ${GREEN}✓${NC} fail2ban: 3 retries → 24h ban, doubling on repeat, max 7 days"
 echo -e "  ${GREEN}✓${NC} Kernel hardening applied (sysctl)"
 echo -e "  ${GREEN}✓${NC} auditd logging active"
+echo -e "  ${GREEN}✓${NC} Login banner configured (/etc/issue updated on boot)"
 echo ""
 echo -e "${YELLOW}IMPORTANT: Before rebooting, open a second terminal and verify${NC}"
 echo -e "${YELLOW}you can SSH in as '${TARGET_USER}' using your key:${NC}"
