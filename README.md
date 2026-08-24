@@ -27,7 +27,7 @@ Automated hardening scripts for a fresh Ubuntu server deployed in a DMZ (demilit
 
 1. **Prompts for the admin username** — you choose the account name at runtime (e.g. `JOHN`). The script validates the input (lowercase, starts with a letter, no spaces) and rejects the installer account name.
 2. Updates and upgrades all installed packages
-3. Creates the chosen admin user and copies SSH keys from the installer account (`ubuntu`). If no keys are found, prompts for a GitHub username and imports them via `ssh-import-id`.
+3. Creates the chosen admin user, prompts for a **sudo password** (used only for `sudo` — SSH stays key-only), and copies SSH keys from the installer account (`ubuntu`). If no keys are found, prompts for a GitHub username and imports them via `ssh-import-id`.
 4. Grants sudo only to the new admin — removes all other accounts from the sudo group and locks the `ubuntu` account
 5. Hardens the SSH daemon (`/etc/ssh/sshd_config.d/99-hardening.conf`):
    - Key-only authentication, no passwords, no root login

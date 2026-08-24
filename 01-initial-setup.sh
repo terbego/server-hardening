@@ -97,6 +97,20 @@ else
     success "User '${TARGET_USER}' created."
 fi
 
+# Set a password — required for sudo (SSH uses key-only, but sudo needs a password).
+echo ""
+echo "  Set a sudo password for '${TARGET_USER}'."
+echo "  This password is ONLY used for sudo — SSH login remains key-only."
+echo ""
+while true; do
+    if passwd "${TARGET_USER}"; then
+        success "Password set for '${TARGET_USER}'."
+        break
+    else
+        warn "Password entry failed or did not match. Try again."
+    fi
+done
+
 # Set up SSH directory
 TARGET_SSH_DIR="/home/${TARGET_USER}/.ssh"
 TARGET_KEYS_FILE="${TARGET_SSH_DIR}/authorized_keys"
@@ -506,7 +520,7 @@ echo -e "${GREEN}  Hardening complete — summary${NC}"
 echo -e "${GREEN}============================================================${NC}"
 echo ""
 echo -e "  ${GREEN}✓${NC} System updated"
-echo -e "  ${GREEN}✓${NC} User '${TARGET_USER}' created with SSH keys"
+echo -e "  ${GREEN}✓${NC} User '${TARGET_USER}' created with SSH keys and sudo password"
 echo -e "  ${GREEN}✓${NC} sudo restricted to '${TARGET_USER}' only"
 [[ "${INSTALLER_USER}" != "${TARGET_USER}" ]] && \
     echo -e "  ${GREEN}✓${NC} Account '${INSTALLER_USER}' locked"
