@@ -23,6 +23,17 @@ header(){ echo ""; echo -e "${CYAN}── $* ──${NC}"; }
 PASS_COUNT=0
 FAIL_COUNT=0
 
+# Ports belonging to the Docker Compose trading bot. None of these may be
+# reachable from the WAN — the dashboard and VNC are reached over SSH tunnels.
+#   8000 dashboard │ 5900 VNC │ 8765 EA bridge │ 5432 timescaledb │ 6379 redis
+BOT_PORTS=(5432 6379 5900 8765 8000)
+DOCKER_FORWARD_SYSCTL="/etc/sysctl.d/99-docker-forward.conf"
+
+# Docker needs net.ipv4.ip_forward = 1. Treat that as acceptable only when the
+# documented drop-in written by 02-add-service.sh is present.
+DOCKER_EXCEPTION=false
+[[ -f "${DOCKER_FORWARD_SYSCTL}" ]] && DOCKER_EXCEPTION=true
+
 # ─────────────────────────────────────────────────────────────────────────────
 # PREFLIGHT
 # ─────────────────────────────────────────────────────────────────────────────
@@ -210,6 +221,27 @@ for rule_desc in "53.*ALLOW OUT.*DNS" "80/tcp.*ALLOW OUT" "443/tcp.*ALLOW OUT" "
     fi
 done
 
+# ── Trading bot ports must never be allowed inbound from Anywhere ────────────
+# A source-restricted rule (ALLOW IN ... FROM 203.0.113.4) is a deliberate
+# choice, so only an unrestricted "Anywhere" rule is treated as a failure.
+UFW_NUMBERED=$(ufw status numbered 2>/dev/null)
+for port in "${BOT_PORTS[@]}"; do
+    # The From column must be "Anywhere" to count as WAN-exposed. The trailing
+    # (#.*)? matters: every rule these scripts create carries a comment, and
+    # anchoring on "Anywhere$" alone would silently miss all of them.
+    exposed=$(echo "${UFW_NUMBERED}" \
+        | grep -E "(^|[^0-9])${port}(/(tcp|udp))?[[:space:]]" \
+        | grep 'ALLOW IN' \
+        | grep -E 'Anywhere( \(v6\))?[[:space:]]*(#.*)?$' || true)
+
+    if [[ -z "${exposed}" ]]; then
+        pass "Bot port ${port} is not allowed inbound from Anywhere."
+    else
+        fail "Bot port ${port} IS allowed inbound from Anywhere — remove it, use an SSH tunnel."
+        echo "         ${exposed}" | head -2
+    fi
+done
+
 # ─────────────────────────────────────────────────────────────────────────────
 # 4. FAIL2BAN
 # ─────────────────────────────────────────────────────────────────────────────
@@ -286,7 +318,24 @@ check_sysctl() {
     fi
 }
 
-check_sysctl "net.ipv4.ip_forward"                    "0" "IPv4 forwarding disabled"
+# IPv4 forwarding is the one DMZ value Docker legitimately needs to flip.
+# It counts as a PASS only when the documented drop-in from 02-add-service.sh
+# explains why — an unexplained ip_forward = 1 is still a failure.
+IP_FORWARD=$(sysctl -n net.ipv4.ip_forward 2>/dev/null)
+if [[ "${DOCKER_EXCEPTION}" == true ]]; then
+    if [[ "${IP_FORWARD}" == "1" ]]; then
+        pass "IPv4 forwarding enabled — Docker exception ($(basename "${DOCKER_FORWARD_SYSCTL}"))."
+    else
+        fail "Docker exception file exists but ip_forward = ${IP_FORWARD:-<not set>}; Docker bridge networking will not work."
+    fi
+elif [[ "${IP_FORWARD}" == "0" ]]; then
+    pass "IPv4 forwarding disabled (net.ipv4.ip_forward = 0)."
+else
+    fail "IPv4 forwarding is enabled with no documented Docker exception."
+    echo "         Expected ${DOCKER_FORWARD_SYSCTL} to exist. If this host runs"
+    echo "         the Docker bot, run 02-add-service.sh option 1. Otherwise set it back to 0."
+fi
+
 check_sysctl "net.ipv6.conf.all.forwarding"           "0" "IPv6 forwarding disabled"
 check_sysctl "net.ipv4.conf.all.send_redirects"       "0" "ICMP redirects (send) disabled"
 check_sysctl "net.ipv4.conf.all.accept_redirects"     "0" "ICMP redirects (accept, IPv4) disabled"
@@ -370,9 +419,73 @@ else
 fi
 
 # ─────────────────────────────────────────────────────────────────────────────
-# 9. PENDING SECURITY UPDATES
+# 9. DOCKER CONTAINMENT
 # ─────────────────────────────────────────────────────────────────────────────
-header "9. Pending security updates"
+# Only meaningful once Docker is installed. Published container ports are DNAT'd
+# and traverse FORWARD, so UFW's INPUT rules never see them — "deny incoming"
+# does not hide a container published on 0.0.0.0. These checks look at the two
+# things that actually contain it: the loopback bind and the DOCKER-USER guard.
+header "9. Docker containment"
+
+if ! command -v docker &>/dev/null; then
+    info "Docker is not installed — skipping container checks."
+else
+    if systemctl is-active --quiet docker; then
+        pass "Docker daemon is running."
+    else
+        warn "Docker is installed but the daemon is not running."
+    fi
+
+    # ── DOCKER-USER guard ──
+    if [[ -x /usr/local/bin/docker-user-guard ]]; then
+        pass "DOCKER-USER guard script is installed."
+    else
+        warn "DOCKER-USER guard not installed. Run 02-add-service.sh option 1."
+    fi
+
+    if systemctl is-enabled --quiet docker-user-guard 2>/dev/null; then
+        pass "docker-user-guard service is enabled."
+    else
+        warn "docker-user-guard service is NOT enabled — rules will be lost on Docker restart."
+    fi
+
+    # Confirm the DROP rules are actually loaded in the live chain.
+    if command -v iptables &>/dev/null; then
+        DOCKER_USER_RULES=$(iptables -S DOCKER-USER 2>/dev/null || true)
+        if [[ -z "${DOCKER_USER_RULES}" ]]; then
+            warn "DOCKER-USER chain is empty or absent (Docker may not have started yet)."
+        elif echo "${DOCKER_USER_RULES}" | grep -q 'multiport.*DROP'; then
+            pass "DOCKER-USER chain contains the bot-port DROP rules."
+        else
+            fail "DOCKER-USER chain has no bot-port DROP rules — a 0.0.0.0 publish would be reachable."
+        fi
+    fi
+
+    # ── Published ports must be loopback-bound ──
+    # 0.0.0.0 or [::] in the host side of a published port means WAN-reachable.
+    if systemctl is-active --quiet docker; then
+        PUBLISHED=$(docker ps --format '{{.Names}}\t{{.Ports}}' 2>/dev/null || true)
+        if [[ -z "${PUBLISHED}" ]]; then
+            info "No running containers to inspect."
+        else
+            WIDE_OPEN=$(echo "${PUBLISHED}" | grep -E '0\.0\.0\.0:|\[::\]:' || true)
+            if [[ -z "${WIDE_OPEN}" ]]; then
+                pass "No running container publishes a port on all interfaces."
+            else
+                fail "Container port(s) published on all interfaces:"
+                echo "${WIDE_OPEN}" | while IFS= read -r line; do
+                    [[ -n "${line}" ]] && echo "         ${line}"
+                done
+                echo "         Re-publish as 127.0.0.1:HOST:CONTAINER and recreate the container."
+            fi
+        fi
+    fi
+fi
+
+# ─────────────────────────────────────────────────────────────────────────────
+# 10. PENDING SECURITY UPDATES
+# ─────────────────────────────────────────────────────────────────────────────
+header "10. Pending security updates"
 
 apt-get update -qq 2>/dev/null || warn "apt-get update failed — could not check for pending updates."
 PENDING=$(apt-get --just-print upgrade 2>/dev/null \

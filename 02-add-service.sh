@@ -2,7 +2,7 @@
 # =============================================================================
 # 02-add-service.sh
 # Interactive script to expose a new service on the server.
-# Run as yasin (with sudo) any time a new service is added.
+# Run as the admin user (with sudo) any time a new service is added.
 #
 # For each service this script will:
 #   • Open the required UFW ports (scoped to a source IP where appropriate)
@@ -10,9 +10,21 @@
 #   • Apply service-specific hardening
 #   • Add a fail2ban jail where applicable
 #   • Reload UFW and the service
+#
+# The Docker/MetaTrader option is different by design: it opens NO inbound
+# ports at all. It only prepares the host to run a Docker Compose stack whose
+# ports stay bound to 127.0.0.1 and are reached over SSH port-forwarding.
 # =============================================================================
 
 set -euo pipefail
+
+# Ports belonging to the Docker Compose trading bot. These must never be
+# reachable from the WAN: the dashboard and VNC are reached over SSH tunnels,
+# and the databases plus the EA bridge stay inside the Compose network.
+#   8000 dashboard (FastAPI) │ 5900 VNC │ 8765 EA bridge
+#   5432 timescaledb         │ 6379 redis
+BOT_PORTS="5432,6379,5900,8765,8000"
+DOCKER_FORWARD_SYSCTL="/etc/sysctl.d/99-docker-forward.conf"
 
 # ── Colours ──────────────────────────────────────────────────────────────────
 RED='\033[0;31m'; GREEN='\033[0;32m'; YELLOW='\033[1;33m'; CYAN='\033[0;36m'; NC='\033[0m'
@@ -387,8 +399,326 @@ bantime  = 1h
     warn "Ensure Redis has 'requirepass' set and 'bind' includes only trusted interfaces."
 }
 
+# ─────────────────────────────────────────────────────────────────────────────
+# DOCKER / METATRADER BOT — localhost only, reached over SSH tunnels
+# ─────────────────────────────────────────────────────────────────────────────
+
+# Enables IPv4 forwarding for Docker's bridge/NAT without touching any other
+# value in 99-dmz-hardening.conf. The filename sorts after that file, so only
+# this single key is overridden.
+enable_docker_forwarding() {
+    info "Enabling IPv4 forwarding for Docker bridge networking..."
+
+    cat > "${DOCKER_FORWARD_SYSCTL}" << 'EOF'
+# Managed by 02-add-service.sh — Docker exception to the DMZ sysctl baseline.
+#
+# Docker's bridge networking NATs container traffic through the host, which
+# requires IPv4 forwarding. 99-dmz-hardening.conf sets ip_forward = 0; this
+# file sorts after it, so it overrides that one key and nothing else.
+#
+# Inbound exposure is still controlled by UFW (default deny) plus the
+# DOCKER-USER guard installed by this script. Enabling forwarding does not
+# publish anything on its own.
+net.ipv4.ip_forward = 1
+
+# IPv6 forwarding stays disabled — the Compose stack is IPv4 only.
+net.ipv6.conf.all.forwarding = 0
+EOF
+
+    sysctl --system -q
+    local actual
+    actual=$(sysctl -n net.ipv4.ip_forward 2>/dev/null)
+    if [[ "${actual}" == "1" ]]; then
+        success "IPv4 forwarding enabled via ${DOCKER_FORWARD_SYSCTL}"
+    else
+        warn "ip_forward is still '${actual}'. Check for a later-sorting file in /etc/sysctl.d/."
+    fi
+}
+
+# Docker publishes ports by inserting DNAT rules that are traversed BEFORE UFW's
+# INPUT chain, so `ufw default deny incoming` does NOT hide a container port that
+# was published on 0.0.0.0. Binding to 127.0.0.1 in compose.yml is the primary
+# defence; this guard is the backstop for when someone forgets.
+install_docker_user_guard() {
+    info "Installing DOCKER-USER guard (backstop for ports published on 0.0.0.0)..."
+
+    cat > /usr/local/bin/docker-user-guard << GUARD
+#!/usr/bin/env bash
+# Managed by 02-add-service.sh — do not edit manually.
+#
+# Docker's published ports bypass UFW's INPUT chain because container traffic is
+# forwarded, not delivered locally. The FORWARD path consults DOCKER-USER first,
+# so that is where the trading bot's ports get protected from the WAN.
+#
+# Rules are inserted with -I because Docker seeds DOCKER-USER with a single
+# '-j RETURN'; anything appended after that RETURN would be unreachable.
+# Every insert is guarded by -C so re-running this script is idempotent.
+set -uo pipefail
+
+PORTS="${BOT_PORTS}"
+
+iptables -N DOCKER-USER 2>/dev/null || true
+
+ins() {
+    iptables -C DOCKER-USER "\$@" 2>/dev/null || iptables -I DOCKER-USER "\$@"
+}
+
+# Inserted in reverse priority order, because -I prepends. Final order is:
+#   established/related RETURN, loopback + RFC1918 RETURN, then DROP.
+ins -p udp -m multiport --dports "\${PORTS}" -j DROP
+ins -p tcp -m multiport --dports "\${PORTS}" -j DROP
+ins -s 10.0.0.0/8      -j RETURN
+ins -s 192.168.0.0/16  -j RETURN
+ins -s 172.16.0.0/12   -j RETURN
+ins -s 127.0.0.0/8     -j RETURN
+ins -m conntrack --ctstate RELATED,ESTABLISHED -j RETURN
+GUARD
+
+    chmod +x /usr/local/bin/docker-user-guard
+
+    # Bound to docker.service: Docker rebuilds its iptables chains whenever it
+    # restarts, so the guard has to be re-applied at that point too.
+    cat > /etc/systemd/system/docker-user-guard.service << 'EOF'
+[Unit]
+Description=Block WAN access to Docker-published trading bot ports
+After=docker.service
+Requires=docker.service
+PartOf=docker.service
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/bin/docker-user-guard
+RemainAfterExit=yes
+
+[Install]
+WantedBy=docker.service multi-user.target
+EOF
+
+    systemctl daemon-reload
+    systemctl enable docker-user-guard.service &>/dev/null || true
+
+    if systemctl is-active --quiet docker; then
+        systemctl start docker-user-guard.service \
+            && success "DOCKER-USER guard active (ports ${BOT_PORTS} blocked from WAN)." \
+            || warn "Guard installed but failed to apply now — it will run on next Docker start."
+    else
+        success "DOCKER-USER guard installed; it will apply when Docker starts."
+    fi
+}
+
+install_docker_engine() {
+    if command -v docker &>/dev/null && docker compose version &>/dev/null; then
+        success "Docker Engine and the Compose plugin are already installed."
+        return
+    fi
+
+    echo ""
+    echo "  Docker Engine and/or the Compose plugin are not installed."
+    read -r -p "  Install them from Docker's official apt repository? [y/N]: " do_install
+    if [[ "${do_install,,}" != "y" ]]; then
+        warn "Skipping Docker install. Install it yourself before starting the stack."
+        return
+    fi
+
+    info "Installing Docker Engine (this uses outbound HTTPS, already allowed by 01)..."
+    apt-get update -qq
+    apt-get install -y -qq ca-certificates curl gnupg
+
+    install -m 0755 -d /etc/apt/keyrings
+    curl -fsSL https://download.docker.com/linux/ubuntu/gpg \
+        -o /etc/apt/keyrings/docker.asc \
+        || die "Could not fetch Docker's GPG key. Check outbound HTTPS (443)."
+    chmod a+r /etc/apt/keyrings/docker.asc
+
+    # arch is resolved at runtime so this works on both arm64 and amd64 hosts.
+    local arch codename
+    arch=$(dpkg --print-architecture)
+    codename=$(. /etc/os-release && echo "${VERSION_CODENAME}")
+    echo "deb [arch=${arch} signed-by=/etc/apt/keyrings/docker.asc] https://download.docker.com/linux/ubuntu ${codename} stable" \
+        > /etc/apt/sources.list.d/docker.list
+
+    apt-get update -qq
+    apt-get install -y -qq docker-ce docker-ce-cli containerd.io \
+        docker-buildx-plugin docker-compose-plugin \
+        || die "Docker install failed. Review the apt output above."
+
+    systemctl enable docker
+    systemctl start docker
+    success "Docker Engine ${arch} installed and started."
+}
+
+# The mt5 container image is linux/amd64. On an ARM64 host it only runs if a
+# qemu-x86_64 binfmt handler is registered for the kernel to hand it off to.
+setup_qemu_emulation() {
+    local host_arch
+    host_arch=$(uname -m)
+
+    if [[ "${host_arch}" != "aarch64" && "${host_arch}" != "arm64" ]]; then
+        info "Host is ${host_arch} — no emulation needed for the linux/amd64 mt5 image."
+        return
+    fi
+
+    info "Host is ${host_arch}. The mt5 image is linux/amd64 and needs QEMU emulation."
+    apt-get install -y -qq qemu-user-static binfmt-support \
+        || warn "Could not install qemu-user-static from apt."
+
+    systemctl restart systemd-binfmt &>/dev/null || true
+
+    # Confirm the handler actually works rather than assuming the package did it.
+    if [[ -e /proc/sys/fs/binfmt_misc/qemu-x86_64 ]]; then
+        success "binfmt handler qemu-x86_64 is registered."
+    else
+        warn "qemu-x86_64 binfmt handler not registered by apt."
+        echo "  Register it through Docker instead:"
+        echo "    sudo docker run --privileged --rm tonistiigi/binfmt --install amd64"
+    fi
+
+    if command -v docker &>/dev/null && systemctl is-active --quiet docker; then
+        echo ""
+        read -r -p "  Verify amd64 emulation now with a test container? [y/N]: " do_verify
+        if [[ "${do_verify,,}" == "y" ]]; then
+            local emulated
+            emulated=$(docker run --rm --platform linux/amd64 alpine uname -m 2>/dev/null || true)
+            if [[ "${emulated}" == "x86_64" ]]; then
+                success "Emulation verified — linux/amd64 containers report x86_64."
+            else
+                warn "Emulation check did not return x86_64 (got: '${emulated:-no output}')."
+                echo "  The mt5 container will not start until this works. Try:"
+                echo "    sudo docker run --privileged --rm tonistiigi/binfmt --install amd64"
+            fi
+        fi
+    fi
+
+    warn "Emulated amd64 under QEMU is significantly slower than native."
+    echo "  Keep the mt5 container to MT5 + the EA bridge; run the bot logic in the"
+    echo "  native arm64 'bot' container so only the terminal pays the QEMU cost."
+}
+
+setup_docker_bot() {
+    echo ""
+    echo -e "${CYAN}  MetaTrader bot — Docker Compose, localhost only${NC}"
+    echo ""
+    echo "  This option prepares the host to run the Compose stack:"
+    echo "    timescaledb (5432) │ redis (6379) │ mt5 (5900 VNC, 8765 bridge) │ bot (8000)"
+    echo ""
+    echo "  It deliberately opens NO inbound ports. Access stays SSH-only:"
+    echo "    • dashboard 8000 and VNC 5900 → SSH port-forwarding"
+    echo "    • 5432 / 6379 / 8765          → internal to the Compose network"
+    echo ""
+    echo "  What it changes:"
+    echo "    1. Enables net.ipv4.ip_forward for Docker bridge networking"
+    echo "    2. Installs Docker Engine + Compose plugin (only if missing)"
+    echo "    3. Registers QEMU binfmt so the linux/amd64 mt5 image runs on ARM64"
+    echo "    4. Installs a DOCKER-USER guard so a stray 0.0.0.0 publish is still blocked"
+    echo "    5. Optionally adds an OUTBOUND rule for a non-443 broker port"
+    echo ""
+    echo "  SSH, fail2ban, unattended-upgrades and the rest of the DMZ posture are"
+    echo "  left untouched."
+    echo ""
+    read -r -p "  Proceed? [y/N]: " confirm
+    [[ "${confirm,,}" == "y" ]] || { info "Skipped."; return; }
+
+    enable_docker_forwarding
+    install_docker_engine
+    setup_qemu_emulation
+    install_docker_user_guard
+
+    # Let the admin drive Compose without sudo on every command. This is not a
+    # privilege increase — the account already has full sudo — but it is worth
+    # stating plainly, since docker group access is equivalent to root.
+    local admin_user="${SUDO_USER:-}"
+    if [[ -n "${admin_user}" ]] && id "${admin_user}" &>/dev/null; then
+        if id -nG "${admin_user}" 2>/dev/null | grep -qw docker; then
+            success "'${admin_user}' is already in the docker group."
+        else
+            echo ""
+            echo "  Adding '${admin_user}' to the docker group allows 'docker compose'"
+            echo "  without sudo. Note that docker group access is root-equivalent."
+            read -r -p "  Add '${admin_user}' to the docker group? [y/N]: " add_grp
+            if [[ "${add_grp,,}" == "y" ]]; then
+                usermod -aG docker "${admin_user}"
+                success "'${admin_user}' added to the docker group."
+                warn "Log out and back in for the new group to take effect."
+            fi
+        fi
+    fi
+
+    # ── Optional outbound-only broker port ──
+    echo ""
+    echo "  Most MT5 brokers connect over HTTPS 443, which 01 already allows."
+    read -r -p "  Does your broker need a non-443 outbound TCP port? [y/N]: " need_broker
+    if [[ "${need_broker,,}" == "y" ]]; then
+        read -r -p "  Broker port number: " broker_port
+        if [[ "${broker_port}" =~ ^[0-9]+$ && "${broker_port}" -ge 1 && "${broker_port}" -le 65535 ]]; then
+            read -r -p "  Broker name (for the rule comment) [Broker]: " broker_name
+            broker_name="${broker_name:-Broker}"
+            # Outbound only — this never makes the host reachable on that port.
+            ufw allow out "${broker_port}/tcp" comment "${broker_name} (MT5 outbound)"
+            success "Outbound TCP ${broker_port} allowed for '${broker_name}'. No inbound rule added."
+        else
+            warn "Invalid port '${broker_port}' — skipped. Re-run and use the custom port option."
+        fi
+    fi
+
+    # ── Closing guidance ──
+    local host_ip admin_hint
+    host_ip=$(hostname -I 2>/dev/null | awk '{print $1}')
+    admin_hint="${admin_user:-<admin-user>}"
+
+    echo ""
+    echo -e "${GREEN}============================================================${NC}"
+    echo -e "${GREEN}  Host ready for the Compose stack${NC}"
+    echo -e "${GREEN}============================================================${NC}"
+    echo ""
+    echo -e "${YELLOW}  Publish every port on the loopback interface only:${NC}"
+    echo ""
+    echo "      ports:"
+    echo "        - \"127.0.0.1:8000:8000\"   # dashboard"
+    echo "        - \"127.0.0.1:5900:5900\"   # VNC"
+    echo ""
+    echo -e "${RED}  Never use \"8000:8000\" or \"0.0.0.0:8000:8000\".${NC}"
+    echo "  That form publishes on every interface, and because Docker's DNAT is"
+    echo "  evaluated before UFW's INPUT chain, 'ufw default deny incoming' will"
+    echo "  not hide it. The DOCKER-USER guard blocks ports ${BOT_PORTS}"
+    echo "  as a backstop, but the loopback bind is what you should rely on."
+    echo ""
+    echo "  Better still, publish nothing for redis, timescaledb and the EA bridge."
+    echo "  Containers reach each other by service name on the Compose network."
+    echo ""
+    echo "  Reach the dashboard and VNC from your workstation with one tunnel:"
+    echo ""
+    echo -e "${CYAN}      ssh -L 5900:127.0.0.1:5900 -L 8000:127.0.0.1:8000 ${admin_hint}@${host_ip:-<vm-ip>}${NC}"
+    echo ""
+    echo "  Then browse to http://localhost:8000 and point your VNC client at"
+    echo "  localhost:5900. Both travel inside the SSH session."
+    echo ""
+    echo "  Start the stack from the bot repo (not managed by this repo):"
+    echo "      cd ~/metatrader && docker compose up -d      # or ./run.sh"
+    echo "      docker compose ps"
+    echo "      docker compose logs -f bot"
+    echo ""
+    echo "  Set 'restart: unless-stopped' on every service so the stack returns"
+    echo "  after the 02:00 UTC unattended-upgrades reboot."
+    echo ""
+    echo "  Confirm nothing leaked onto the WAN:"
+    echo "      sudo bash 03-verify-hardening.sh"
+    echo "      docker compose ps --format '{{.Service}} {{.Ports}}'"
+}
+
 setup_custom_port() {
     echo ""
+    echo "  Direction:"
+    echo "    1) Outbound — let this host reach a remote service"
+    echo "       (use this for an MT5 broker on a non-443 port; adds no inbound exposure)"
+    echo "    2) Inbound  — let remote hosts reach a service on this host"
+    echo ""
+    read -r -p "  Choice [1/2]: " CUSTOM_DIR
+    case "${CUSTOM_DIR}" in
+        1) CUSTOM_DIR="out" ;;
+        2) CUSTOM_DIR="in"  ;;
+        *) die "Invalid direction. Choose 1 (outbound) or 2 (inbound)." ;;
+    esac
+
     read -r -p "  Port number: " CUSTOM_PORT
     [[ "${CUSTOM_PORT}" =~ ^[0-9]+$ && "${CUSTOM_PORT}" -ge 1 && "${CUSTOM_PORT}" -le 65535 ]] \
         || die "Invalid port number."
@@ -401,9 +731,26 @@ setup_custom_port() {
     read -r -p "  Comment/label for this rule: " CUSTOM_COMMENT
     CUSTOM_COMMENT="${CUSTOM_COMMENT:-custom}"
 
+    if [[ "${CUSTOM_DIR}" == "out" ]]; then
+        ufw allow out "${CUSTOM_PORT}/${CUSTOM_PROTO}" comment "${CUSTOM_COMMENT}"
+        success "Outbound ${CUSTOM_PORT}/${CUSTOM_PROTO} allowed. No inbound rule added."
+        return
+    fi
+
+    # Inbound — refuse to expose a trading bot port on the WAN.
+    if [[ ",${BOT_PORTS}," == *",${CUSTOM_PORT},"* ]]; then
+        warn "Port ${CUSTOM_PORT} belongs to the Docker trading bot stack."
+        echo "  The dashboard and VNC are meant to be reached over an SSH tunnel:"
+        echo "    ssh -L 5900:127.0.0.1:5900 -L 8000:127.0.0.1:8000 <user>@<vm-ip>"
+        echo "  Opening it inbound would expose it to the WAN."
+        read -r -p "  Open it inbound anyway? [y/N]: " force_bot_port
+        [[ "${force_bot_port,,}" == "y" ]] || { info "Skipped — use an SSH tunnel instead."; return; }
+        warn "Proceeding against recommendation. 03-verify-hardening.sh will flag this."
+    fi
+
     prompt_source_ip
     open_port "${CUSTOM_PROTO}" "${CUSTOM_PORT}" "${CUSTOM_COMMENT}"
-    success "Port ${CUSTOM_PORT}/${CUSTOM_PROTO} opened."
+    success "Inbound ${CUSTOM_PORT}/${CUSTOM_PROTO} opened."
 }
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -422,29 +769,41 @@ echo ""
 while true; do
     echo ""
     echo -e "${CYAN}What service do you want to add?${NC}"
-    echo "  1) Web server (nginx)                  — opens 80, 443; hardens nginx; configures Certbot"
-    echo "  2) Reverse proxy (nginx)               — same as above; adds proxy_pass template for your app"
-    echo "  3) FastAPI / Python API (uvicorn)      — opens a custom port; rate-limits; adds fail2ban jail"
-    echo "  4) PostgreSQL                          — locks to loopback (recommended) or opens 5432"
-    echo "  5) MySQL / MariaDB                     — locks to loopback (recommended) or opens 3306"
-    echo "  6) Redis                               — locks to loopback (recommended) or opens 6379"
-    echo "  7) Custom port                         — opens any port/protocol with optional source IP"
-    echo "  8) Show current UFW rules"
-    echo "  9) Exit"
     echo ""
-    read -r -p "Choice [1-9]: " CHOICE
+    echo -e "  ${GREEN}Docker Compose trading bot${NC}"
+    echo "  1) MetaTrader bot (Docker)             — no inbound ports; SSH tunnels only"
+    echo ""
+    echo -e "  ${CYAN}Host-installed services${NC}"
+    echo "  2) Web server (nginx)                  — opens 80, 443; hardens nginx; configures Certbot"
+    echo "  3) Reverse proxy (nginx)               — same as above; adds proxy_pass template for your app"
+    echo "  4) FastAPI / Python API (uvicorn)      — opens a custom port; rate-limits; adds fail2ban jail"
+    echo "  5) PostgreSQL                          — locks to loopback (recommended) or opens 5432"
+    echo "  6) MySQL / MariaDB                     — locks to loopback (recommended) or opens 3306"
+    echo "  7) Redis                               — locks to loopback (recommended) or opens 6379"
+    echo ""
+    echo -e "  ${CYAN}Other${NC}"
+    echo "  8) Custom port                         — inbound or outbound; optional source IP"
+    echo "  9) Show current UFW rules"
+    echo " 10) Exit"
+    echo ""
+    echo -e "  ${YELLOW}Running the Docker bot? Use option 1 only.${NC}"
+    echo "  Options 4-7 install services on the host and are not needed: the bot"
+    echo "  ships its own FastAPI, Postgres and Redis inside the Compose stack."
+    echo ""
+    read -r -p "Choice [1-10]: " CHOICE
 
     case "${CHOICE}" in
-        1) setup_nginx "webserver"   ; reload_ufw ;;
-        2) setup_nginx "reverseproxy"; reload_ufw ;;
-        3) setup_python_api          ; reload_ufw ;;
-        4) setup_postgres                         ;;
-        5) setup_mysql                            ;;
-        6) setup_redis                            ;;
-        7) setup_custom_port         ; reload_ufw ;;
-        8) ufw status numbered ;;
-        9) echo "Done."; exit 0 ;;
-        *) warn "Invalid choice. Enter a number between 1 and 9." ;;
+        1) setup_docker_bot                       ;;
+        2) setup_nginx "webserver"   ; reload_ufw ;;
+        3) setup_nginx "reverseproxy"; reload_ufw ;;
+        4) setup_python_api          ; reload_ufw ;;
+        5) setup_postgres                         ;;
+        6) setup_mysql                            ;;
+        7) setup_redis                            ;;
+        8) setup_custom_port         ; reload_ufw ;;
+        9) ufw status numbered ;;
+       10) echo "Done."; exit 0 ;;
+        *) warn "Invalid choice. Enter a number between 1 and 10." ;;
     esac
 
     echo ""

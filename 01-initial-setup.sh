@@ -262,12 +262,18 @@ ufw allow in 22/tcp comment "SSH"
 # ── Outbound — minimum required for system operation ──
 ufw allow out 53    comment "DNS"
 ufw allow out 80/tcp  comment "HTTP (apt, feeds)"
-ufw allow out 443/tcp comment "HTTPS (apt, OpenAI, Anthropic, exchanges, Telegram, Discord)"
+ufw allow out 443/tcp comment "HTTPS (apt, Docker Hub, broker login, news, LLM APIs)"
 ufw allow out 123/udp comment "NTP (time sync)"
 
-# NOTE: If your trading bot connects to a broker or exchange on a non-standard
-# port, add a rule here:
+# NOTE: Inbound is SSH only, by design. The trading bot runs as a Docker Compose
+# stack and is reached over SSH port-forwarding, so its ports (dashboard 8000,
+# VNC 5900, EA bridge 8765, Postgres 5432, Redis 6379) are never opened here.
+# Run 02-add-service.sh and choose the Docker/MetaTrader option to prepare the
+# host for Compose without exposing any of those ports.
+#
+# If an MT5 broker uses a non-standard TCP port, that is an OUTBOUND rule only:
 #   ufw allow out <PORT>/tcp comment "Broker XYZ"
+# 02-add-service.sh can add it for you (custom port -> outbound direction).
 
 ufw --force enable
 
@@ -360,6 +366,11 @@ cat > /etc/sysctl.d/99-dmz-hardening.conf << 'EOF'
 # ── Network — DMZ posture ────────────────────────────────────────────────────
 
 # No IP forwarding — this is not a router.
+#
+# NOTE: Docker's bridge networking requires net.ipv4.ip_forward = 1. Do not edit
+# this file to enable it. 02-add-service.sh writes /etc/sysctl.d/99-docker-forward.conf
+# instead, which sorts after this file and therefore overrides just this one key
+# while leaving every other hardening value below intact.
 net.ipv4.ip_forward = 0
 net.ipv6.conf.all.forwarding = 0
 
@@ -420,7 +431,8 @@ kernel.yama.ptrace_scope = 1
 # Disable the magic SysRq key (not needed on a server).
 kernel.sysrq = 0
 
-# Increase the size of the connection tracking table (for high-volume trading).
+# Increase the size of the connection tracking table. Container NAT consumes
+# conntrack entries, so this headroom matters once the Compose stack is running.
 net.netfilter.nf_conntrack_max = 131072
 EOF
 
@@ -535,6 +547,11 @@ echo ""
 echo -e "${YELLOW}IMPORTANT: Before rebooting, open a second terminal and verify${NC}"
 echo -e "${YELLOW}you can SSH in as '${TARGET_USER}' using your key:${NC}"
 echo -e "  ssh ${TARGET_USER}@$(hostname -I | awk '{print $1}')"
+echo ""
+echo "  Next step for the Docker Compose trading bot:"
+echo "    sudo bash 02-add-service.sh   → choose the MetaTrader bot (Docker) option"
+echo "  That prepares the host for Compose without opening any bot ports."
+echo "  The dashboard (8000) and VNC (5900) are reached over SSH tunnels only."
 echo ""
 read -r -p "Reboot now to apply all changes? [y/N] " reboot_now
 if [[ "${reboot_now,,}" == "y" ]]; then
