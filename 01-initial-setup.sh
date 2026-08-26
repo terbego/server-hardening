@@ -218,10 +218,11 @@ MaxSessions 2
 MaxStartups 3:50:10
 LoginGraceTime 20
 
-# Reduce attack surface — no forwarding, no X11.
+# Local SSH tunnels only (ssh -L to 127.0.0.1). Needed for VNC/dashboard.
+# Not a jump host: remote forwarding and GatewayPorts stay off.
 X11Forwarding no
 AllowAgentForwarding no
-AllowTcpForwarding no
+AllowTcpForwarding local
 PermitTunnel no
 GatewayPorts no
 
@@ -264,6 +265,23 @@ ufw allow out 53    comment "DNS"
 ufw allow out 80/tcp  comment "HTTP (apt, feeds)"
 ufw allow out 443/tcp comment "HTTPS (apt, Docker Hub, broker login, news, LLM APIs)"
 ufw allow out 123/udp comment "NTP (time sync)"
+
+# Host ↔ Compose bridge. Do not open 5900/8000/5432/8765 to the internet.
+# 02-add-service.sh option 1 still installs docker-user-guard; these rules
+# are enough for docker-proxy if you go straight to trader-bot/install.sh.
+ufw allow in on docker0 comment "docker"
+ufw allow out on docker0 comment "docker"
+ufw allow in on br+ comment "compose bridges"
+ufw allow out on br+ comment "compose bridges"
+sed -i 's/^DEFAULT_FORWARD_POLICY=.*/DEFAULT_FORWARD_POLICY="ACCEPT"/' /etc/default/ufw || true
+
+# Docker published ports need IPv4 forwarding. 99-docker-forward.conf sorts
+# after 99-dmz-hardening.conf so the rest of the DMZ sysctl stays intact.
+cat > /etc/sysctl.d/99-docker-forward.conf << 'EOF'
+net.ipv4.ip_forward = 1
+net.ipv6.conf.all.forwarding = 0
+EOF
+sysctl -w net.ipv4.ip_forward=1 >/dev/null || true
 
 # NOTE: Inbound is SSH only, by design. The trading bot runs as a Docker Compose
 # stack and is reached over SSH port-forwarding, so its ports (dashboard 8000,

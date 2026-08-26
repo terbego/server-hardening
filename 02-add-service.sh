@@ -687,7 +687,7 @@ setup_docker_bot() {
     echo ""
     echo "  Reach the dashboard and VNC from your workstation with one tunnel:"
     echo ""
-    echo -e "${CYAN}      ssh -L 5900:127.0.0.1:5900 -L 8000:127.0.0.1:8000 ${admin_hint}@${host_ip:-<vm-ip>}${NC}"
+    echo -e "${CYAN}      ssh -L 15900:127.0.0.1:5900 -L 8000:127.0.0.1:8000 ${admin_hint}@${host_ip:-<vm-ip>}${NC}"
     echo ""
     echo "  Then browse to http://localhost:8000 and point your VNC client at"
     echo "  localhost:5900. Both travel inside the SSH session."
@@ -741,7 +741,7 @@ setup_custom_port() {
     if [[ ",${BOT_PORTS}," == *",${CUSTOM_PORT},"* ]]; then
         warn "Port ${CUSTOM_PORT} belongs to the Docker trading bot stack."
         echo "  The dashboard and VNC are meant to be reached over an SSH tunnel:"
-        echo "    ssh -L 5900:127.0.0.1:5900 -L 8000:127.0.0.1:8000 <user>@<vm-ip>"
+        echo "    ssh -L 15900:127.0.0.1:5900 -L 8000:127.0.0.1:8000 <user>@<vm-ip>"
         echo "  Opening it inbound would expose it to the WAN."
         read -r -p "  Open it inbound anyway? [y/N]: " force_bot_port
         [[ "${force_bot_port,,}" == "y" ]] || { info "Skipped — use an SSH tunnel instead."; return; }

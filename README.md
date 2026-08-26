@@ -23,7 +23,7 @@ sudo bash 03-verify-hardening.sh  # confirm nothing is exposed
 Then reach the bot from your workstation:
 
 ```bash
-ssh -L 5900:127.0.0.1:5900 -L 8000:127.0.0.1:8000 <your-admin-username>@<vm-ip>
+ssh -L 15900:127.0.0.1:5900 -L 8000:127.0.0.1:8000 <your-admin-username>@<vm-ip>
 ```
 
 ---
@@ -50,6 +50,7 @@ The trading bot's own repository is deployed separately. These scripts only prep
 5. Hardens the SSH daemon (`/etc/ssh/sshd_config.d/99-hardening.conf`):
    - Key-only authentication, no passwords, no root login
    - `AllowUsers <your-username>` — no other account can SSH in
+   - `AllowTcpForwarding local` — `ssh -L` to localhost only (VNC/dashboard). Not a jump host
    - `MaxAuthTries 3` / `MaxStartups 3:50:10` / `MaxSessions 2`
 6. Configures UFW (DMZ posture):
    - Default deny all inbound and outbound
@@ -250,7 +251,7 @@ docker compose logs -f bot
 Nothing is published to the WAN, so admin access goes through one SSH tunnel from your workstation:
 
 ```bash
-ssh -L 5900:127.0.0.1:5900 -L 8000:127.0.0.1:8000 <your-admin-username>@<vm-ip>
+ssh -L 15900:127.0.0.1:5900 -L 8000:127.0.0.1:8000 <your-admin-username>@<vm-ip>
 ```
 
 While that session is open:
