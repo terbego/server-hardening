@@ -189,12 +189,19 @@ else
     warn "LoginGraceTime = ${GRACE:-<not set>} (recommended ≤ 30 s)."
 fi
 
-# Hardening drop-in file exists
-SSH_DROP_IN="/etc/ssh/sshd_config.d/99-hardening.conf"
-if [[ -f "${SSH_DROP_IN}" ]]; then
-    pass "Hardening drop-in exists: ${SSH_DROP_IN}"
+# Hardening drop-in: 00- sorts first (OpenSSH first-wins). 99- is the old name
+# and loses to 50-cloud-init.conf (PasswordAuthentication yes).
+if [[ -f /etc/ssh/sshd_config.d/00-hardening.conf ]]; then
+    pass "Hardening drop-in exists: /etc/ssh/sshd_config.d/00-hardening.conf"
+elif [[ -f /etc/ssh/sshd_config.d/99-hardening.conf ]]; then
+    fail "Only 99-hardening.conf exists — 50-cloud-init.conf wins (passwords stay on). Re-run 01."
 else
-    fail "Hardening drop-in NOT found: ${SSH_DROP_IN}"
+    fail "Hardening drop-in NOT found (expected /etc/ssh/sshd_config.d/00-hardening.conf)."
+fi
+
+if [[ -f /etc/ssh/sshd_config.d/50-cloud-init.conf ]] \
+    && grep -qE '^[[:space:]]*PasswordAuthentication[[:space:]]+yes' /etc/ssh/sshd_config.d/50-cloud-init.conf; then
+    fail "50-cloud-init.conf still has PasswordAuthentication yes — OpenSSH first-wins keeps passwords on."
 fi
 
 # ─────────────────────────────────────────────────────────────────────────────

@@ -510,14 +510,17 @@ if command -v iptables >/dev/null 2>&1; then
 fi
 
 # ── nftables (Docker 29 native backend on Ubuntu 26.04) ──────────────────────
-# Own table, hook forward at priority -15 so it runs before Docker's chains.
+# Own table, hook forward. Docker 29 nftables filter-FORWARD sits at priority
+# 0 (or -100 depending on engine build). More-negative runs first; -200 is
+# before both. DROP is final even if Docker later accepts (nftables accept
+# is per-chain, not global) — still run first so WAN hits never reach DNAT.
 # Idempotent: delete + recreate the table on every run.
 if command -v nft >/dev/null 2>&1; then
     nft delete table inet hardening-docker-user 2>/dev/null || true
     nft -f - << NFT
 table inet hardening-docker-user {
     chain forward {
-        type filter hook forward priority -15; policy accept;
+        type filter hook forward priority -200; policy accept;
         ct state established,related accept
         ip saddr { 127.0.0.0/8, 10.0.0.0/8, 172.16.0.0/12, 192.168.0.0/16 } accept
         ip6 saddr { ::1, fc00::/7 } accept

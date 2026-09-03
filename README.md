@@ -47,7 +47,7 @@ The trading bot's own repository is deployed separately. These scripts only prep
 2. Updates and upgrades all installed packages
 3. Creates the chosen admin user, prompts for a **sudo password** (used only for `sudo` — SSH stays key-only), and copies SSH keys from the installer account (`ubuntu`). If no keys are found, prompts for a GitHub username and imports them via `ssh-import-id`.
 4. Grants sudo only to the new admin — removes all other accounts from the sudo group and locks the `ubuntu` account
-5. Hardens the SSH daemon (`/etc/ssh/sshd_config.d/99-hardening.conf`):
+5. Hardens the SSH daemon (`/etc/ssh/sshd_config.d/00-hardening.conf` — must sort *before* cloud-init's `50-cloud-init.conf`, because OpenSSH first-wins):
    - Key-only authentication, no passwords, no root login
    - `AllowUsers <your-username>` — no other account can SSH in
    - `AllowTcpForwarding local` — `ssh -L` to localhost only (VNC/dashboard). Not a jump host
@@ -303,12 +303,12 @@ This never makes the VM reachable on that port. Do not add an inbound rule for a
 
 | Area | 24.04 | 26.04 | What the scripts do |
 |---|---|---|---|
-| SSH | `ssh.service` may stay running | Socket-activated (`ssh.socket` + `ssh@.service`). `systemctl status sshd` looks "dead" while SSH still works | Write a drop-in under `sshd_config.d` and reload only if a daemon is actually running. Never disable `ssh.socket`. |
+| SSH | `ssh.service` may stay running | Socket-activated (`ssh.socket` + `ssh@.service`). `systemctl status sshd` looks "dead" while SSH still works | Write `00-hardening.conf` (not `99-`) so it wins over cloud-init's `PasswordAuthentication yes`. Reload only if a daemon is running. Never disable `ssh.socket`. |
 | OpenSSH | 9.6 | 10.2 (split `sshd` / `sshd-auth` / `sshd-session`) | No `ChallengeResponseAuthentication` (rejected or ignored on 10.x). Use `KbdInteractiveAuthentication no`. |
-| fail2ban | journald, no `/var/log/auth.log` | Same, plus socket-activated SSH units | `backend = systemd`, install `python3-systemd`, `journalmatch` covers `ssh.service`, `ssh.socket`, and `_COMM=sshd` / `sshd-auth`. Ban with nftables. |
+| fail2ban | journald, no `/var/log/auth.log` | Same, plus socket-activated SSH units and OpenSSH 10 `sshd-session` | `backend = systemd`, install `python3-systemd`, `journalmatch` covers `ssh.service`, `ssh.socket`, and `_COMM=sshd` / `sshd-auth` / `sshd-session`. Ban with nftables. |
 | auditd | Single `auditd.service` | `audit-rules.service` + `auditd.service` | Enable both when the unit exists. |
 | Docker apt | `noble` index | `resolute` index, sometimes 404 for a while | Probe the suite; fall back to `noble` packages if the current codename has no Packages file. |
-| Docker firewall | iptables-nft, `DOCKER-USER` | Docker 29 defaults to nftables | Guard writes iptables `DOCKER-USER` **and** an `inet hardening-docker-user` nftables table. |
+| Docker firewall | iptables-nft, `DOCKER-USER` | Docker 29 can use native nftables (no `DOCKER-USER`) | Guard writes iptables `DOCKER-USER` **and** an `inet hardening-docker-user` table at priority `-200` (before Docker's filter-FORWARD). |
 | nginx HTTP/2 | `listen 443 ssl http2;` | Parameter removed; `http2 on;` | Detect nginx version and write the matching listen block. |
 
 ### Automatic reboot at 02:00 UTC can interrupt a trading session

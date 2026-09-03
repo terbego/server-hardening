@@ -250,7 +250,10 @@ success "Sudo access restricted to '${TARGET_USER}'."
 # ─────────────────────────────────────────────────────────────────────────────
 info "Hardening SSH daemon..."
 
-SSH_HARDENING_FILE="/etc/ssh/sshd_config.d/99-hardening.conf"
+# OpenSSH first-wins + lex order: 50-cloud-init.conf (PasswordAuthentication yes)
+# is processed BEFORE 99-*. A 99- drop-in never overrides it. 00- sorts first.
+SSH_HARDENING_FILE="/etc/ssh/sshd_config.d/00-hardening.conf"
+rm -f /etc/ssh/sshd_config.d/99-hardening.conf
 
 cat > "${SSH_HARDENING_FILE}" << EOF
 # Managed by 01-initial-setup.sh — do not edit manually.
@@ -287,6 +290,20 @@ PermitUserEnvironment no
 PrintLastLog yes
 Banner none
 EOF
+
+# Drop-ins only apply if the main file includes them (Ubuntu does this at the
+# top; a minimal/custom image might not).
+if ! grep -qE '^Include[[:space:]]+/etc/ssh/sshd_config.d/' /etc/ssh/sshd_config; then
+    sed -i '1i Include /etc/ssh/sshd_config.d/*.conf' /etc/ssh/sshd_config
+    info "Added Include /etc/ssh/sshd_config.d/*.conf to sshd_config."
+fi
+
+# cloud-init writes PasswordAuthentication yes into 50-cloud-init.conf on every
+# boot-ish refresh. Neutralize it so a later re-render cannot sneak past 00-.
+if [[ -f /etc/ssh/sshd_config.d/50-cloud-init.conf ]]; then
+    sed -i -E 's/^[[:space:]]*PasswordAuthentication[[:space:]]+yes/PasswordAuthentication no/' \
+        /etc/ssh/sshd_config.d/50-cloud-init.conf
+fi
 
 reload_ssh_safely
 
@@ -429,7 +446,7 @@ backend    = systemd
 # 26.04 socket activation: ssh.socket + per-connection ssh@.service.
 # OpenSSH 10 splits the daemon: sshd / sshd-auth / sshd-session.
 # _COMM catches the process name regardless of the unit that owns the journal.
-journalmatch = _SYSTEMD_UNIT=sshd.service + _SYSTEMD_UNIT=ssh.service + _SYSTEMD_UNIT=ssh.socket + _COMM=sshd + _COMM=sshd-auth
+journalmatch = _SYSTEMD_UNIT=sshd.service + _SYSTEMD_UNIT=ssh.service + _SYSTEMD_UNIT=ssh.socket + _COMM=sshd + _COMM=sshd-auth + _COMM=sshd-session
 maxretry   = 3
 findtime   = 10m
 bantime    = 24h
