@@ -122,7 +122,9 @@ done
 # Admin has at least one SSH authorized key
 KEYS_FILE="/home/${TARGET_USER}/.ssh/authorized_keys"
 if [[ -s "${KEYS_FILE}" ]]; then
-    KEY_COUNT=$(grep -c 'ssh-' "${KEYS_FILE}" 2>/dev/null || true)
+    # Count real key lines, not just those containing "ssh-" (ecdsa-sha2-nistp256
+    # and sk-ecdsa keys do not).
+    KEY_COUNT=$(grep -cE '^(ssh-|ecdsa-|sk-)' "${KEYS_FILE}" 2>/dev/null || true)
     pass "'${TARGET_USER}' has ${KEY_COUNT} SSH authorized key(s)."
 else
     fail "No SSH authorized_keys found for '${TARGET_USER}' — login will require a password or fail entirely."
@@ -283,6 +285,19 @@ if [[ -n "${SSH_JAIL}" ]]; then
     pass "sshd jail active — currently banned: ${CURRENTLY_BANNED:-0}, total: ${TOTAL_BANNED:-0}."
 else
     fail "sshd fail2ban jail is NOT active (fail2ban-client status sshd failed)."
+fi
+
+# 24.04/26.04 have no /var/log/auth.log unless rsyslog is installed. A file
+# backend jail will sit idle. backend=systemd is required.
+F2B_BACKEND=$(fail2ban-client get sshd backend 2>/dev/null || true)
+if echo "${F2B_BACKEND}" | grep -qw systemd; then
+    pass "sshd jail reads systemd-journald (backend = systemd)."
+elif [[ -n "${F2B_BACKEND}" ]]; then
+    fail "sshd jail backend is not systemd (${F2B_BACKEND}) — bans will miss journal-only SSH logs."
+fi
+
+if ! dpkg -s python3-systemd >/dev/null 2>&1; then
+    warn "python3-systemd is not installed — backend=systemd cannot query the journal."
 fi
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -505,8 +520,13 @@ else
         fi
     fi
     if [[ "${GUARD_OK}" == false ]]; then
-        fail "No live bot-port DROP rules found (iptables DOCKER-USER or nftables hardening-docker-user)."
-        echo "         Run 02-add-service.sh option 1, then start Docker."
+        if systemctl is-active --quiet docker; then
+            fail "No live bot-port DROP rules found (iptables DOCKER-USER or nftables hardening-docker-user)."
+            echo "         Run 02-add-service.sh option 1 so the guard is applied."
+        else
+            warn "No live bot-port DROP rules (Docker is not running, so the chains are empty)."
+            echo "         They are applied by docker-user-guard.service when Docker starts."
+        fi
     fi
 
     # ── Published ports must be loopback-bound ──

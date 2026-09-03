@@ -121,6 +121,8 @@ sudo bash 02-add-service.sh
 To                         Action      From
 --                         ------      ----
 22/tcp                     ALLOW IN    Anywhere        # SSH
+Anywhere on docker0        ALLOW IN    Anywhere        # docker bridge (not WAN)
+Anywhere on br+            ALLOW IN    Anywhere        # compose bridges (not WAN)
 
 53                         ALLOW OUT   Anywhere        # DNS
 80/tcp                     ALLOW OUT   Anywhere        # HTTP
@@ -128,7 +130,7 @@ To                         Action      From
 123/udp                    ALLOW OUT   Anywhere        # NTP
 ```
 
-All other inbound and outbound traffic is **denied by default**. Inbound stays SSH-only even after the trading bot is running.
+All other inbound and outbound traffic is **denied by default**. The `docker0` / `br+` rules are interface-scoped so containers can talk to the host; they do not publish 8000/5900/5432 on the WAN. Inbound from the internet stays SSH-only even after the trading bot is running.
 
 > For the trading bot: every outbound connection it needs (broker login, Docker Hub image pulls, news feeds, optional LLM APIs) uses HTTPS 443, which is already allowed. Postgres, Redis and the EA bridge talk to each other inside the Compose network, so UFW never sees that traffic. If your MT5 broker uses a non-standard port, add it as an **outbound** rule only — `02-add-service.sh` option 8, direction "outbound". It is never an inbound rule.
 
@@ -258,7 +260,7 @@ ssh -L 15900:127.0.0.1:5900 -L 8000:127.0.0.1:8000 <your-admin-username>@<vm-ip>
 While that session is open:
 
 - Dashboard → <http://localhost:8000>
-- VNC client → `localhost:5900`
+- VNC client → `localhost:15900` (the tunnel binds local 15900 because 5900 is often already taken on the workstation)
 
 Both travel inside the SSH connection. Close the session and the access is gone.
 

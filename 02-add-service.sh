@@ -81,8 +81,12 @@ add_fail2ban_jail() {
     local jail_name="$1"
     local jail_config="$2"
     echo "${jail_config}" > "/etc/fail2ban/jail.d/${jail_name}.conf"
-    systemctl restart fail2ban
-    success "fail2ban jail '${jail_name}' enabled."
+    if systemctl restart fail2ban; then
+        success "fail2ban jail '${jail_name}' enabled."
+    else
+        warn "Wrote /etc/fail2ban/jail.d/${jail_name}.conf but fail2ban failed to restart."
+        warn "Check: sudo journalctl -u fail2ban -e"
+    fi
 }
 
 reload_ufw() {
@@ -448,7 +452,10 @@ net.ipv4.ip_forward = 1
 net.ipv6.conf.all.forwarding = 0
 EOF
 
-    sysctl --system -q
+    # Same trap as 01: --system exits non-zero if any key is unknown
+    # (nf_conntrack_max before the module is loaded). Do not abort option 1.
+    sysctl --system >/dev/null 2>&1 || true
+    sysctl -p "${DOCKER_FORWARD_SYSCTL}" >/dev/null 2>&1 || true
     local actual
     actual=$(sysctl -n net.ipv4.ip_forward 2>/dev/null)
     if [[ "${actual}" == "1" ]]; then
@@ -585,10 +592,13 @@ install_docker_engine() {
     local arch suite
     arch=$(dpkg --print-architecture)
     suite="${UBUNTU_CODENAME}"
-    if ! curl -fsI --max-time 15 \
-            "https://download.docker.com/linux/ubuntu/dists/${suite}/stable/binary-${arch}/Packages" \
-            >/dev/null 2>&1; then
-        warn "Docker has no '${suite}' apt index yet — falling back to 'noble' (24.04)."
+    # HEAD is not reliable here (some CDNs return 403/405 for Packages).
+    # Probe the small InRelease file with GET and accept only HTTP 200.
+    local docker_probe
+    docker_probe=$(curl -sS -o /dev/null -w "%{http_code}" --max-time 15 \
+        "https://download.docker.com/linux/ubuntu/dists/${suite}/InRelease" || echo "000")
+    if [[ "${docker_probe}" != "200" ]]; then
+        warn "Docker has no '${suite}' apt index (HTTP ${docker_probe}) — falling back to 'noble' (24.04)."
         suite="noble"
     fi
     echo "deb [arch=${arch} signed-by=/etc/apt/keyrings/docker.asc] https://download.docker.com/linux/ubuntu ${suite} stable" \
@@ -747,7 +757,8 @@ setup_docker_bot() {
     echo -e "${CYAN}      ssh -L 15900:127.0.0.1:5900 -L 8000:127.0.0.1:8000 ${admin_hint}@${host_ip:-<vm-ip>}${NC}"
     echo ""
     echo "  Then browse to http://localhost:8000 and point your VNC client at"
-    echo "  localhost:5900. Both travel inside the SSH session."
+    echo "  localhost:15900 (local 15900, not 5900 — 5900 is often already taken"
+    echo "  on the workstation). Both travel inside the SSH session."
     echo ""
     echo "  Start the stack from the bot repo (not managed by this repo):"
     echo "      cd ~/metatrader && docker compose up -d      # or ./run.sh"

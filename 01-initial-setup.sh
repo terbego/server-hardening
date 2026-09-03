@@ -7,8 +7,8 @@
 # What this script does:
 #   1. Preflight checks
 #   2. Full system update
-#   3. Create user 'yasin' and import SSH keys
-#   4. Grant sudo only to 'yasin'; strip and lock all other accounts
+#   3. Create the admin user and import SSH keys
+#   4. Grant sudo only to that admin; strip and lock all other accounts
 #   5. Harden SSH daemon
 #   6. Configure UFW firewall (DMZ posture: deny all, allow SSH only)
 #   7. Configure unattended-upgrades (security patches, auto-reboot at 02:00)
@@ -138,14 +138,16 @@ apt-get autoclean -qq
 success "System updated."
 
 # ─────────────────────────────────────────────────────────────────────────────
-# 3. CREATE USER 'yasin' AND IMPORT SSH KEYS
+# 3. CREATE ADMIN USER AND IMPORT SSH KEYS
 # ─────────────────────────────────────────────────────────────────────────────
 info "Creating user '${TARGET_USER}'..."
 
 if id "${TARGET_USER}" &>/dev/null; then
     warn "User '${TARGET_USER}' already exists — skipping creation."
 else
-    adduser --disabled-password --gecos "" "${TARGET_USER}"
+    # --gecos is still accepted on 24.04; 26.04 adduser prefers --comment.
+    adduser --disabled-password --gecos "" "${TARGET_USER}" 2>/dev/null \
+        || adduser --disabled-password --comment "" "${TARGET_USER}"
     success "User '${TARGET_USER}' created."
 fi
 
@@ -203,11 +205,11 @@ chmod 700 "${TARGET_SSH_DIR}"
 success "SSH keys configured for '${TARGET_USER}'."
 
 # ─────────────────────────────────────────────────────────────────────────────
-# 4. SUDO — yasin ONLY
+# 4. SUDO — admin user only
 # ─────────────────────────────────────────────────────────────────────────────
 info "Configuring sudo access..."
 
-# Add yasin to the sudo group
+# Add the new admin to the sudo group
 usermod -aG sudo "${TARGET_USER}"
 
 # Remove all other non-system accounts from the sudo group
@@ -253,7 +255,7 @@ SSH_HARDENING_FILE="/etc/ssh/sshd_config.d/99-hardening.conf"
 cat > "${SSH_HARDENING_FILE}" << EOF
 # Managed by 01-initial-setup.sh — do not edit manually.
 
-# Only the 'yasin' account may log in via SSH.
+# Only this account may log in via SSH.
 AllowUsers ${TARGET_USER}
 
 # Disable all non-key authentication methods.
@@ -438,9 +440,12 @@ action     = ${FAIL2BAN_BANACTION}
 EOF
 
 systemctl enable fail2ban
-systemctl restart fail2ban
-
-success "fail2ban configured (3 retries → 24h ban, doubling on repeat, max 7 days)."
+if systemctl restart fail2ban; then
+    success "fail2ban configured (3 retries → 24h ban, doubling on repeat, max 7 days)."
+else
+    warn "fail2ban failed to start. Kernel hardening and auditd will still run."
+    warn "Fix with: sudo journalctl -u fail2ban -e  &&  sudo systemctl restart fail2ban"
+fi
 
 # ─────────────────────────────────────────────────────────────────────────────
 # 9. KERNEL HARDENING (sysctl)
