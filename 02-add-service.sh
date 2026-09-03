@@ -33,6 +33,20 @@ success() { echo -e "${GREEN}[OK]${NC}    $*"; }
 warn()    { echo -e "${YELLOW}[WARN]${NC}  $*"; }
 die()     { echo -e "${RED}[FAIL]${NC}  $*" >&2; exit 1; }
 
+. /etc/os-release
+UBUNTU_VERSION="${VERSION_ID:-unknown}"
+UBUNTU_CODENAME="${UBUNTU_CODENAME:-${VERSION_CODENAME:-unknown}}"
+
+# fail2ban ban action that works on both LTS releases.
+# 24.04: iptables-nft. 26.04: native nftables. The nftables action is valid on both.
+fail2ban_banaction() {
+    if command -v nft &>/dev/null; then
+        echo "nftables[type=multiport]"
+    else
+        echo "iptables-multiport"
+    fi
+}
+
 # ─────────────────────────────────────────────────────────────────────────────
 # PREFLIGHT
 # ─────────────────────────────────────────────────────────────────────────────
@@ -122,7 +136,16 @@ EOF
 
     if [[ "${mode}" == "reverseproxy" ]]; then
         info "Creating reverse proxy site template..."
-        cat > /etc/nginx/sites-available/reverse-proxy << 'EOF'
+        # Ubuntu 24.04 = nginx 1.24: `listen 443 ssl http2;`
+        # Ubuntu 26.04 = nginx 1.28: the http2 listen parameter is gone; use `http2 on;`.
+        local nginx_listen nginx_http2
+        nginx_listen="    listen 443 ssl http2;"
+        nginx_http2=""
+        if nginx -v 2>&1 | grep -qE 'nginx/1\.(2[5-9]|[3-9])|nginx/[2-9]'; then
+            nginx_listen="    listen 443 ssl;"
+            nginx_http2=$'    http2 on;\n'
+        fi
+        cat > /etc/nginx/sites-available/reverse-proxy << EOF
 # Reverse proxy template — edit upstream and server_name, then enable with:
 #   ln -s /etc/nginx/sites-available/reverse-proxy /etc/nginx/sites-enabled/
 #   certbot --nginx -d yourdomain.com
@@ -138,12 +161,12 @@ server {
     server_name yourdomain.com;  # Change to your domain
 
     # Redirect all HTTP to HTTPS — certbot will fill this in automatically.
-    return 301 https://$host$request_uri;
+    return 301 https://\$host\$request_uri;
 }
 
 server {
-    listen 443 ssl http2;
-    server_name yourdomain.com;  # Change to your domain
+${nginx_listen}
+${nginx_http2}    server_name yourdomain.com;  # Change to your domain
 
     # TLS — certbot will inject certificate paths here.
     # ssl_certificate     /etc/letsencrypt/live/yourdomain.com/fullchain.pem;
@@ -155,12 +178,12 @@ server {
     location / {
         proxy_pass         http://backend;
         proxy_http_version 1.1;
-        proxy_set_header   Upgrade $http_upgrade;
+        proxy_set_header   Upgrade \$http_upgrade;
         proxy_set_header   Connection "upgrade";
-        proxy_set_header   Host $host;
-        proxy_set_header   X-Real-IP $remote_addr;
-        proxy_set_header   X-Forwarded-For $proxy_add_x_forwarded_for;
-        proxy_set_header   X-Forwarded-Proto $scheme;
+        proxy_set_header   Host \$host;
+        proxy_set_header   X-Real-IP \$remote_addr;
+        proxy_set_header   X-Forwarded-For \$proxy_add_x_forwarded_for;
+        proxy_set_header   X-Forwarded-Proto \$scheme;
         proxy_read_timeout 86400;
     }
 }
@@ -227,7 +250,7 @@ filter       = ${APP_NAME}
 maxretry     = 20
 findtime     = 1m
 bantime      = 30m
-action       = iptables-multiport[name=${APP_NAME}, port=${API_PORT}, protocol=tcp]
+action       = $(fail2ban_banaction)
 "
 
     # Write a minimal fail2ban filter that matches uvicorn's access-log format.
@@ -439,39 +462,64 @@ EOF
 # INPUT chain, so `ufw default deny incoming` does NOT hide a container port that
 # was published on 0.0.0.0. Binding to 127.0.0.1 in compose.yml is the primary
 # defence; this guard is the backstop for when someone forgets.
+#
+# Two backends:
+#   24.04 / Docker iptables  — DOCKER-USER chain (iptables-nft)
+#   26.04 / Docker 29 nft    — native nftables table, because DOCKER-USER may
+#                              not exist on the iptables compatibility layer
 install_docker_user_guard() {
     info "Installing DOCKER-USER guard (backstop for ports published on 0.0.0.0)..."
+
+    command -v nft &>/dev/null || apt-get install -y -qq nftables || true
+    command -v iptables &>/dev/null || apt-get install -y -qq iptables || true
 
     cat > /usr/local/bin/docker-user-guard << GUARD
 #!/usr/bin/env bash
 # Managed by 02-add-service.sh — do not edit manually.
 #
 # Docker's published ports bypass UFW's INPUT chain because container traffic is
-# forwarded, not delivered locally. The FORWARD path consults DOCKER-USER first,
-# so that is where the trading bot's ports get protected from the WAN.
-#
-# Rules are inserted with -I because Docker seeds DOCKER-USER with a single
-# '-j RETURN'; anything appended after that RETURN would be unreachable.
-# Every insert is guarded by -C so re-running this script is idempotent.
+# forwarded, not delivered locally. Apply the same policy on both firewall
+# backends so this works on Ubuntu 24.04 (iptables-nft) and 26.04 (nftables).
 set -uo pipefail
 
 PORTS="${BOT_PORTS}"
 
-iptables -N DOCKER-USER 2>/dev/null || true
+# ── iptables / iptables-nft (DOCKER-USER) ────────────────────────────────────
+# Rules are inserted with -I because Docker seeds DOCKER-USER with a single
+# '-j RETURN'; anything appended after that RETURN would be unreachable.
+# Every insert is guarded by -C so re-running this script is idempotent.
+if command -v iptables >/dev/null 2>&1; then
+    iptables -N DOCKER-USER 2>/dev/null || true
+    ins() {
+        iptables -C DOCKER-USER "\$@" 2>/dev/null || iptables -I DOCKER-USER "\$@"
+    }
+    ins -p udp -m multiport --dports "\${PORTS}" -j DROP
+    ins -p tcp -m multiport --dports "\${PORTS}" -j DROP
+    ins -s 10.0.0.0/8      -j RETURN
+    ins -s 192.168.0.0/16  -j RETURN
+    ins -s 172.16.0.0/12   -j RETURN
+    ins -s 127.0.0.0/8     -j RETURN
+    ins -m conntrack --ctstate RELATED,ESTABLISHED -j RETURN
+fi
 
-ins() {
-    iptables -C DOCKER-USER "\$@" 2>/dev/null || iptables -I DOCKER-USER "\$@"
+# ── nftables (Docker 29 native backend on Ubuntu 26.04) ──────────────────────
+# Own table, hook forward at priority -15 so it runs before Docker's chains.
+# Idempotent: delete + recreate the table on every run.
+if command -v nft >/dev/null 2>&1; then
+    nft delete table inet hardening-docker-user 2>/dev/null || true
+    nft -f - << NFT
+table inet hardening-docker-user {
+    chain forward {
+        type filter hook forward priority -15; policy accept;
+        ct state established,related accept
+        ip saddr { 127.0.0.0/8, 10.0.0.0/8, 172.16.0.0/12, 192.168.0.0/16 } accept
+        ip6 saddr { ::1, fc00::/7 } accept
+        tcp dport { \${PORTS} } drop
+        udp dport { \${PORTS} } drop
+    }
 }
-
-# Inserted in reverse priority order, because -I prepends. Final order is:
-#   established/related RETURN, loopback + RFC1918 RETURN, then DROP.
-ins -p udp -m multiport --dports "\${PORTS}" -j DROP
-ins -p tcp -m multiport --dports "\${PORTS}" -j DROP
-ins -s 10.0.0.0/8      -j RETURN
-ins -s 192.168.0.0/16  -j RETURN
-ins -s 172.16.0.0/12   -j RETURN
-ins -s 127.0.0.0/8     -j RETURN
-ins -m conntrack --ctstate RELATED,ESTABLISHED -j RETURN
+NFT
+fi
 GUARD
 
     chmod +x /usr/local/bin/docker-user-guard
@@ -531,10 +579,19 @@ install_docker_engine() {
     chmod a+r /etc/apt/keyrings/docker.asc
 
     # arch is resolved at runtime so this works on both arm64 and amd64 hosts.
-    local arch codename
+    # Suite: prefer this release's codename (noble on 24.04, resolute on 26.04).
+    # Docker's index for a brand-new LTS sometimes 404s for weeks; noble packages
+    # are binary-compatible and are the documented fallback.
+    local arch suite
     arch=$(dpkg --print-architecture)
-    codename=$(. /etc/os-release && echo "${VERSION_CODENAME}")
-    echo "deb [arch=${arch} signed-by=/etc/apt/keyrings/docker.asc] https://download.docker.com/linux/ubuntu ${codename} stable" \
+    suite="${UBUNTU_CODENAME}"
+    if ! curl -fsI --max-time 15 \
+            "https://download.docker.com/linux/ubuntu/dists/${suite}/stable/binary-${arch}/Packages" \
+            >/dev/null 2>&1; then
+        warn "Docker has no '${suite}' apt index yet — falling back to 'noble' (24.04)."
+        suite="noble"
+    fi
+    echo "deb [arch=${arch} signed-by=/etc/apt/keyrings/docker.asc] https://download.docker.com/linux/ubuntu ${suite} stable" \
         > /etc/apt/sources.list.d/docker.list
 
     apt-get update -qq
@@ -762,6 +819,7 @@ echo -e "${CYAN}============================================================${NC
 echo -e "${CYAN}  Ubuntu DMZ — Add Service${NC}"
 echo -e "${CYAN}============================================================${NC}"
 echo ""
+echo "  Ubuntu         : ${UBUNTU_VERSION} (${UBUNTU_CODENAME})"
 echo "  Current UFW status:"
 ufw status | sed 's/^/    /'
 echo ""

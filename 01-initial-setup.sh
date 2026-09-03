@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # =============================================================================
 # 01-initial-setup.sh
-# Initial hardening script for a fresh Ubuntu server in a DMZ environment.
+# Initial hardening script for a fresh Ubuntu 24.04 or 26.04 server in a DMZ.
 # Run once as the default installer user (e.g. ubuntu) with sudo privileges.
 #
 # What this script does:
@@ -27,10 +27,61 @@ success() { echo -e "${GREEN}[OK]${NC}    $*"; }
 warn()    { echo -e "${YELLOW}[WARN]${NC}  $*"; }
 die()     { echo -e "${RED}[FAIL]${NC}  $*" >&2; exit 1; }
 
+# ── Ubuntu 24.04 / 26.04 compatibility ───────────────────────────────────────
+# Both LTS releases are first-class targets. Helpers below absorb the deltas:
+#   • 26.04 SSH is socket-activated (ssh.socket + ssh@.service)
+#   • 26.04 OpenSSH 10 dropped ChallengeResponseAuthentication as a real keyword
+#   • 26.04 auditd split: audit-rules.service loads rules, auditd.service logs
+#   • 24.04+ has no rsyslog by default — fail2ban must use backend=systemd
+#   • 26.04 firewall path is nftables; 24.04 is iptables-nft (nftables action works on both)
+. /etc/os-release
+UBUNTU_VERSION="${VERSION_ID:-unknown}"
+UBUNTU_CODENAME="${UBUNTU_CODENAME:-${VERSION_CODENAME:-unknown}}"
+
+require_supported_ubuntu() {
+    if [[ "${ID:-}" != "ubuntu" ]]; then
+        warn "This script is written for Ubuntu. Detected '${ID:-unknown}'."
+    fi
+    case "${UBUNTU_VERSION}" in
+        24.04|26.04)
+            info "Detected Ubuntu ${UBUNTU_VERSION} (${UBUNTU_CODENAME}) — supported."
+            ;;
+        22.04)
+            warn "Ubuntu 22.04 is not a primary target. Most steps still work."
+            ;;
+        *)
+            warn "Ubuntu ${UBUNTU_VERSION} is untested (supported: 24.04 and 26.04)."
+            read -r -p "  Continue anyway? [y/N] " go
+            [[ "${go,,}" == "y" ]] || die "Aborted."
+            ;;
+    esac
+}
+
+# Reload sshd without assuming a long-lived ssh.service.
+# 24.04 may run ssh.service continuously; 26.04 defaults to ssh.socket and only
+# spawns ssh@.service per connection. The drop-in in sshd_config.d is read by
+# every new instance, so we must not disable socket activation.
+reload_ssh_safely() {
+    mkdir -p /run/sshd
+    sshd -t -f /etc/ssh/sshd_config || die "SSH config validation failed. Aborting to prevent lockout."
+
+    if systemctl is-active --quiet ssh || systemctl is-active --quiet sshd; then
+        systemctl reload ssh 2>/dev/null \
+            || systemctl reload sshd 2>/dev/null \
+            || warn "Could not reload the running sshd — new connections will pick up the drop-in."
+    fi
+
+    if systemctl is-active --quiet ssh.socket 2>/dev/null \
+        || systemctl is-enabled --quiet ssh.socket 2>/dev/null; then
+        info "SSH is socket-activated (ssh.socket). New connections inherit ${SSH_HARDENING_FILE}."
+    fi
+}
+
 # ─────────────────────────────────────────────────────────────────────────────
 # 1. PREFLIGHT
 # ─────────────────────────────────────────────────────────────────────────────
 [[ $EUID -eq 0 ]] || die "This script must be run as root (sudo ./01-initial-setup.sh)."
+require_supported_ubuntu
 
 # Identify the installer user (the user who invoked sudo, or 'ubuntu' as fallback)
 INSTALLER_USER="${SUDO_USER:-ubuntu}"
@@ -42,6 +93,7 @@ echo -e "${CYAN}  Ubuntu DMZ Hardening — Initial Setup${NC}"
 echo -e "${CYAN}============================================================${NC}"
 echo ""
 echo "  Installer user : ${INSTALLER_USER}"
+echo "  Ubuntu         : ${UBUNTU_VERSION} (${UBUNTU_CODENAME})"
 echo ""
 
 # Prompt for the admin username to create
@@ -205,10 +257,12 @@ cat > "${SSH_HARDENING_FILE}" << EOF
 AllowUsers ${TARGET_USER}
 
 # Disable all non-key authentication methods.
+# KbdInteractiveAuthentication is the OpenSSH 8.7+ name. Do not also set
+# ChallengeResponseAuthentication — OpenSSH 10 (Ubuntu 26.04) treats that as a
+# deprecated alias and some builds reject it, which would make sshd -t fail.
 PermitRootLogin no
 PasswordAuthentication no
 KbdInteractiveAuthentication no
-ChallengeResponseAuthentication no
 UsePAM yes
 PubkeyAuthentication yes
 
@@ -232,13 +286,7 @@ PrintLastLog yes
 Banner none
 EOF
 
-# Create privilege separation directory if missing (required by sshd -t on some Ubuntu versions)
-mkdir -p /run/sshd
-
-# Validate config before reloading
-sshd -t -f /etc/ssh/sshd_config || die "SSH config validation failed. Aborting to prevent lockout."
-
-systemctl reload ssh || systemctl reload sshd || warn "Could not reload sshd — config will apply on next restart."
+reload_ssh_safely
 
 success "SSH hardened. Restrictions written to ${SSH_HARDENING_FILE}"
 
@@ -331,8 +379,12 @@ Unattended-Upgrade::SyslogEnable "true";
 Unattended-Upgrade::Verbose "false";
 EOF
 
-systemctl enable unattended-upgrades
-systemctl restart unattended-upgrades
+# The long-running service exists on 24.04. 26.04 still ships it, but the
+# actual cadence is apt-daily.timer + apt-daily-upgrade.timer — enable both
+# so either activation model applies patches.
+systemctl enable unattended-upgrades 2>/dev/null || true
+systemctl enable apt-daily.timer apt-daily-upgrade.timer 2>/dev/null || true
+systemctl restart unattended-upgrades 2>/dev/null || true
 
 success "Automatic security updates configured (auto-reboot at 02:00 if required)."
 
@@ -341,7 +393,29 @@ success "Automatic security updates configured (auto-reboot at 02:00 if required
 # ─────────────────────────────────────────────────────────────────────────────
 info "Installing and configuring fail2ban..."
 
-apt-get install -y -qq fail2ban
+# python3-systemd is required for backend=systemd. Without it the sshd jail
+# silently fails to start on a journald-only host (rsyslog is not installed
+# by default on 24.04 or 26.04, so /var/log/auth.log does not exist).
+apt-get install -y -qq fail2ban python3-systemd
+
+# nftables action works on 24.04 (iptables-nft) and is required on 26.04,
+# where a plain iptables-multiport ban can land on a chain the packet never
+# traverses. action_mwl is intentionally not used: it needs sendmail/whois
+# (neither is installed, and whois is outbound TCP 43 which UFW denies).
+FAIL2BAN_BANACTION="iptables-multiport"
+FAIL2BAN_BANACTION_ALL="iptables-allports"
+if command -v nft &>/dev/null || apt-get install -y -qq nftables; then
+    FAIL2BAN_BANACTION="nftables[type=multiport]"
+    FAIL2BAN_BANACTION_ALL="nftables[type=allports]"
+fi
+
+cat > /etc/fail2ban/jail.local << EOF
+[DEFAULT]
+ignoreip = 127.0.0.1/8 ::1
+backend  = systemd
+banaction = ${FAIL2BAN_BANACTION}
+banaction_allports = ${FAIL2BAN_BANACTION_ALL}
+EOF
 
 cat > /etc/fail2ban/jail.d/sshd.conf << EOF
 [sshd]
@@ -349,25 +423,18 @@ enabled    = true
 port       = ssh
 filter     = sshd
 backend    = systemd
+# 24.04 long-lived unit: ssh.service (or sshd.service).
+# 26.04 socket activation: ssh.socket + per-connection ssh@.service.
+# OpenSSH 10 splits the daemon: sshd / sshd-auth / sshd-session.
+# _COMM catches the process name regardless of the unit that owns the journal.
+journalmatch = _SYSTEMD_UNIT=sshd.service + _SYSTEMD_UNIT=ssh.service + _SYSTEMD_UNIT=ssh.socket + _COMM=sshd + _COMM=sshd-auth
 maxretry   = 3
 findtime   = 10m
-
-# First ban: 24 hours. Each repeat doubles it, capped at 7 days.
 bantime    = 24h
 bantime.increment  = true
 bantime.multiplier = 2
 bantime.maxtime    = 168h
-
-# Use action_mwl to log offender info (whois + relevant log lines).
-# Falls back gracefully if sendmail is not installed.
-action     = %(action_mwl)s
-EOF
-
-# Ensure fail2ban uses its own copy of the filter, not a missing systemd journal
-cat > /etc/fail2ban/jail.local << 'EOF'
-[DEFAULT]
-# Global defaults — individual jails override as needed.
-ignoreip = 127.0.0.1/8 ::1
+action     = ${FAIL2BAN_BANACTION}
 EOF
 
 systemctl enable fail2ban
@@ -449,12 +516,24 @@ kernel.yama.ptrace_scope = 1
 # Disable the magic SysRq key (not needed on a server).
 kernel.sysrq = 0
 
-# Increase the size of the connection tracking table. Container NAT consumes
-# conntrack entries, so this headroom matters once the Compose stack is running.
-net.netfilter.nf_conntrack_max = 131072
 EOF
 
-sysctl --system -q
+# nf_conntrack_max only exists after the module is loaded. Writing it into the
+# drop-in on a host that has never NATed anything makes `sysctl --system` exit
+# non-zero, which would abort the rest of this script under `set -e`.
+if modprobe nf_conntrack 2>/dev/null || [[ -e /proc/sys/net/netfilter/nf_conntrack_max ]]; then
+    echo "" >> /etc/sysctl.d/99-dmz-hardening.conf
+    echo "# Container NAT consumes conntrack entries once Compose is running." >> /etc/sysctl.d/99-dmz-hardening.conf
+    echo "net.netfilter.nf_conntrack_max = 131072" >> /etc/sysctl.d/99-dmz-hardening.conf
+fi
+
+# --system returns non-zero if any single key is unknown. Apply best-effort.
+sysctl --system >/dev/null 2>&1 || true
+# Re-assert the Docker exception so a later-sorting unknown-key failure cannot
+# leave ip_forward at the DMZ baseline of 0.
+if [[ -f /etc/sysctl.d/99-docker-forward.conf ]]; then
+    sysctl -p /etc/sysctl.d/99-docker-forward.conf >/dev/null 2>&1 || true
+fi
 
 success "Kernel hardening applied."
 
@@ -463,7 +542,13 @@ success "Kernel hardening applied."
 # ─────────────────────────────────────────────────────────────────────────────
 info "Installing auditd..."
 
-apt-get install -y -qq auditd audispd-plugins
+# audispd-plugins was renamed / folded on some 26.04 images. auditd itself
+# is the required package; the plugins package is best-effort.
+if apt-cache show audispd-plugins >/dev/null 2>&1; then
+    apt-get install -y -qq auditd audispd-plugins
+else
+    apt-get install -y -qq auditd
+fi
 
 cat > /etc/audit/rules.d/99-dmz.rules << 'EOF'
 # Delete all existing rules and set the default action to 'deny'.
@@ -494,8 +579,14 @@ cat > /etc/audit/rules.d/99-dmz.rules << 'EOF'
 -e 2
 EOF
 
+# auditd 4.x (Ubuntu 26.04) splits loading and logging:
+#   audit-rules.service  — loads /etc/audit/rules.d/
+#   auditd.service       — writes the log
+# Enable both when the unit exists; 24.04 only has auditd.service.
 systemctl enable auditd
-systemctl restart auditd
+systemctl enable audit-rules 2>/dev/null || true
+systemctl restart auditd 2>/dev/null || true
+systemctl restart audit-rules 2>/dev/null || true
 
 success "auditd installed and configured."
 

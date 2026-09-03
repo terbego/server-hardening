@@ -43,10 +43,20 @@ echo ""
 echo -e "${CYAN}============================================================${NC}"
 echo -e "${CYAN}  Ubuntu DMZ Hardening — Verification Report${NC}"
 echo -e "${CYAN}============================================================${NC}"
+. /etc/os-release
+UBUNTU_VERSION="${VERSION_ID:-unknown}"
+UBUNTU_CODENAME="${UBUNTU_CODENAME:-${VERSION_CODENAME:-unknown}}"
+
 echo "  Host    : $(hostname)"
 echo "  Date    : $(date -u '+%Y-%m-%d %H:%M:%S UTC')"
 echo "  Kernel  : $(uname -r)"
-echo "  OS      : $(lsb_release -ds 2>/dev/null || grep PRETTY_NAME /etc/os-release | cut -d= -f2 | tr -d '"')"
+echo "  Ubuntu  : ${UBUNTU_VERSION} (${UBUNTU_CODENAME})"
+echo "  OS      : $(lsb_release -ds 2>/dev/null || echo "${PRETTY_NAME:-unknown}")"
+
+case "${UBUNTU_VERSION}" in
+    24.04|26.04) ;;
+    *) warn "Untested Ubuntu ${UBUNTU_VERSION}. Supported releases: 24.04 and 26.04." ;;
+esac
 
 # ── Prompt for admin username to validate ────────────────────────────────────
 echo ""
@@ -142,7 +152,14 @@ check_sshd "passwordauthentication"      "no"  "Password authentication disabled
 check_sshd "pubkeyauthentication"        "yes" "Public key authentication enabled"
 check_sshd "x11forwarding"              "no"  "X11 forwarding disabled"
 check_sshd "allowagentforwarding"       "no"  "Agent forwarding disabled"
-check_sshd "allowtcpforwarding"         "no"  "TCP forwarding disabled"
+# 01 sets AllowTcpForwarding local so ssh -L to 127.0.0.1 works (VNC / dashboard).
+# "no" is also acceptable on a host that never needed tunnels.
+ALLOW_TCP=$(echo "${SSHD_T}" | grep -i '^allowtcpforwarding ' | awk '{print tolower($2)}')
+if [[ "${ALLOW_TCP}" == "local" || "${ALLOW_TCP}" == "no" ]]; then
+    pass "TCP forwarding is ${ALLOW_TCP} (local tunnels only, or fully disabled)."
+else
+    fail "TCP forwarding — expected 'local' or 'no', got '${ALLOW_TCP:-<not set>}'"
+fi
 check_sshd "permittunnel"               "no"  "Tunnel disabled"
 check_sshd "kbdinteractiveauthentication" "no" "Keyboard-interactive auth disabled"
 
@@ -273,16 +290,21 @@ fi
 # ─────────────────────────────────────────────────────────────────────────────
 header "5. Automatic security updates"
 
-if systemctl is-active --quiet unattended-upgrades; then
-    pass "unattended-upgrades service is running."
+# 24.04: unattended-upgrades.service is a long-running unit.
+# 26.04: the same unit may be oneshot/inactive between runs; the timers are
+# what actually fire. Accept either activation model.
+if systemctl is-enabled --quiet unattended-upgrades 2>/dev/null \
+    || systemctl is-enabled --quiet apt-daily-upgrade.timer 2>/dev/null; then
+    pass "Automatic upgrades are enabled (unattended-upgrades and/or apt-daily-upgrade.timer)."
 else
-    fail "unattended-upgrades service is NOT running."
+    fail "Neither unattended-upgrades nor apt-daily-upgrade.timer is enabled."
 fi
 
-if systemctl is-enabled --quiet unattended-upgrades; then
-    pass "unattended-upgrades is enabled at boot."
+if systemctl is-active --quiet unattended-upgrades \
+    || systemctl is-active --quiet apt-daily-upgrade.timer; then
+    pass "Automatic-upgrade path is active."
 else
-    fail "unattended-upgrades is NOT enabled at boot."
+    warn "unattended-upgrades is not running right now (oneshot units look inactive between runs)."
 fi
 
 if [[ -f /etc/apt/apt.conf.d/20auto-upgrades ]]; then
@@ -377,6 +399,23 @@ else
     fail "auditd is NOT enabled at boot."
 fi
 
+# auditd 4.x (Ubuntu 26.04) loads rules from a separate unit. Skip on 24.04
+# where the unit does not exist.
+if systemctl list-unit-files audit-rules.service &>/dev/null \
+    && systemctl list-unit-files audit-rules.service | grep -q audit-rules; then
+    if systemctl is-enabled --quiet audit-rules 2>/dev/null; then
+        pass "audit-rules.service is enabled (26.04 rules loader)."
+    else
+        fail "audit-rules.service exists but is not enabled — rules may not load on boot."
+    fi
+    if systemctl is-active --quiet audit-rules 2>/dev/null \
+        || systemctl show -p Result --value audit-rules 2>/dev/null | grep -q success; then
+        pass "audit-rules.service has loaded (or last run succeeded)."
+    else
+        warn "audit-rules.service is not active — check 'systemctl status audit-rules'."
+    fi
+fi
+
 AUDIT_RULES_FILE="/etc/audit/rules.d/99-dmz.rules"
 if [[ -f "${AUDIT_RULES_FILE}" ]]; then
     pass "Audit rules file exists: ${AUDIT_RULES_FILE}"
@@ -449,16 +488,25 @@ else
         warn "docker-user-guard service is NOT enabled — rules will be lost on Docker restart."
     fi
 
-    # Confirm the DROP rules are actually loaded in the live chain.
+    # Confirm the DROP rules are actually loaded. 24.04 uses iptables DOCKER-USER;
+    # 26.04 / Docker 29 may only have the nftables table we install alongside it.
+    GUARD_OK=false
     if command -v iptables &>/dev/null; then
         DOCKER_USER_RULES=$(iptables -S DOCKER-USER 2>/dev/null || true)
-        if [[ -z "${DOCKER_USER_RULES}" ]]; then
-            warn "DOCKER-USER chain is empty or absent (Docker may not have started yet)."
-        elif echo "${DOCKER_USER_RULES}" | grep -q 'multiport.*DROP'; then
-            pass "DOCKER-USER chain contains the bot-port DROP rules."
-        else
-            fail "DOCKER-USER chain has no bot-port DROP rules — a 0.0.0.0 publish would be reachable."
+        if echo "${DOCKER_USER_RULES}" | grep -q 'multiport.*DROP'; then
+            pass "iptables DOCKER-USER chain contains the bot-port DROP rules."
+            GUARD_OK=true
         fi
+    fi
+    if command -v nft &>/dev/null; then
+        if nft list table inet hardening-docker-user >/dev/null 2>&1; then
+            pass "nftables table hardening-docker-user is loaded (26.04 Docker nft backend)."
+            GUARD_OK=true
+        fi
+    fi
+    if [[ "${GUARD_OK}" == false ]]; then
+        fail "No live bot-port DROP rules found (iptables DOCKER-USER or nftables hardening-docker-user)."
+        echo "         Run 02-add-service.sh option 1, then start Docker."
     fi
 
     # ── Published ports must be loopback-bound ──

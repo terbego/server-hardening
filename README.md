@@ -30,7 +30,7 @@ ssh -L 15900:127.0.0.1:5900 -L 8000:127.0.0.1:8000 <your-admin-username>@<vm-ip>
 
 ## Prerequisites
 
-- Fresh Ubuntu 22.04 LTS or 24.04 LTS server (**ARM64** or amd64)
+- Fresh **Ubuntu 24.04 LTS or 26.04 LTS** server (**ARM64** or amd64). 22.04 still mostly works but is not a primary target.
 - A default installer account with sudo (typically `ubuntu`)
 - SSH keys already present in `~ubuntu/.ssh/authorized_keys` (imported via GitHub during installation, or added manually)
 - Run as root or via `sudo`
@@ -52,6 +52,7 @@ The trading bot's own repository is deployed separately. These scripts only prep
    - `AllowUsers <your-username>` — no other account can SSH in
    - `AllowTcpForwarding local` — `ssh -L` to localhost only (VNC/dashboard). Not a jump host
    - `MaxAuthTries 3` / `MaxStartups 3:50:10` / `MaxSessions 2`
+   - Works with Ubuntu 26.04 socket-activated SSH (`ssh.socket`) and with a long-lived `ssh.service` on 24.04. Does not disable socket activation.
 6. Configures UFW (DMZ posture):
    - Default deny all inbound and outbound
    - Inbound: SSH (22) only
@@ -292,8 +293,21 @@ This never makes the VM reachable on that port. Do not add an inbound rule for a
 ## Security notes
 
 - The `ubuntu` account is **locked** (not deleted). Cloud-init may require it to exist. Do not delete it.
-- Audit logs are written to `/var/log/audit/audit.log`. The ruleset is made immutable (`-e 2`) — changing audit rules requires a reboot.
+- Audit logs are written to `/var/log/audit/audit.log`. The ruleset is made immutable (`-e 2`) — changing audit rules requires a reboot. On Ubuntu 26.04, `audit-rules.service` loads the rules and `auditd.service` writes the log — both must be enabled.
 - fail2ban ban history persists across restarts. To manually unban an IP: `sudo fail2ban-client set sshd unbanip <IP>`.
+- Supported releases are **Ubuntu 24.04 LTS and 26.04 LTS**. The scripts detect the version at runtime and pick the matching SSH reload path, fail2ban backend, Docker apt suite, and firewall action (nftables on both; iptables-nft still works on 24.04).
+
+### Ubuntu 24.04 vs 26.04
+
+| Area | 24.04 | 26.04 | What the scripts do |
+|---|---|---|---|
+| SSH | `ssh.service` may stay running | Socket-activated (`ssh.socket` + `ssh@.service`). `systemctl status sshd` looks "dead" while SSH still works | Write a drop-in under `sshd_config.d` and reload only if a daemon is actually running. Never disable `ssh.socket`. |
+| OpenSSH | 9.6 | 10.2 (split `sshd` / `sshd-auth` / `sshd-session`) | No `ChallengeResponseAuthentication` (rejected or ignored on 10.x). Use `KbdInteractiveAuthentication no`. |
+| fail2ban | journald, no `/var/log/auth.log` | Same, plus socket-activated SSH units | `backend = systemd`, install `python3-systemd`, `journalmatch` covers `ssh.service`, `ssh.socket`, and `_COMM=sshd` / `sshd-auth`. Ban with nftables. |
+| auditd | Single `auditd.service` | `audit-rules.service` + `auditd.service` | Enable both when the unit exists. |
+| Docker apt | `noble` index | `resolute` index, sometimes 404 for a while | Probe the suite; fall back to `noble` packages if the current codename has no Packages file. |
+| Docker firewall | iptables-nft, `DOCKER-USER` | Docker 29 defaults to nftables | Guard writes iptables `DOCKER-USER` **and** an `inet hardening-docker-user` nftables table. |
+| nginx HTTP/2 | `listen 443 ssl http2;` | Parameter removed; `http2 on;` | Detect nginx version and write the matching listen block. |
 
 ### Automatic reboot at 02:00 UTC can interrupt a trading session
 
