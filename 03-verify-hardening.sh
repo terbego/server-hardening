@@ -479,6 +479,14 @@ else
     warn "update-issue service is NOT enabled at boot."
 fi
 
+if [[ -f /etc/issue ]]; then
+    if grep -qE 'Local IP[[:space:]]*:[[:space:]]*[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+' /etc/issue; then
+        pass "/etc/issue shows a local IPv4 address."
+    else
+        warn "/etc/issue has no local IPv4 (still 'unavailable'?). Run: sudo /usr/local/bin/update-issue"
+    fi
+fi
+
 # ─────────────────────────────────────────────────────────────────────────────
 # 9. DOCKER CONTAINMENT
 # ─────────────────────────────────────────────────────────────────────────────

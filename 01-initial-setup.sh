@@ -444,7 +444,8 @@ filter     = sshd
 backend    = systemd
 # 24.04 long-lived unit: ssh.service (or sshd.service).
 # 26.04 socket activation: ssh.socket + per-connection ssh@.service.
-# OpenSSH 10 splits the daemon: sshd / sshd-auth / sshd-session.
+# OpenSSH 9.8+/10 splits the daemon: sshd / sshd-auth / sshd-session.
+# Auth failures now tag as sshd-session — omitting it means no bans on 26.04.
 # _COMM catches the process name regardless of the unit that owns the journal.
 journalmatch = _SYSTEMD_UNIT=sshd.service + _SYSTEMD_UNIT=ssh.service + _SYSTEMD_UNIT=ssh.socket + _COMM=sshd + _COMM=sshd-auth + _COMM=sshd-session
 maxretry   = 3
@@ -618,17 +619,85 @@ success "auditd installed and configured."
 # ─────────────────────────────────────────────────────────────────────────────
 info "Configuring login banner with IP addresses..."
 
+# Ubuntu 26.04 minimal cloud images dropped curl (pollinate was removed and
+# curl rode along as a dependency). Install it so WAN lookup has a client.
+apt-get install -y -qq curl ca-certificates || true
+
 cat > /usr/local/bin/update-issue << 'BANNER_SCRIPT'
 #!/usr/bin/env bash
-LOCAL_IP=$(ip -4 route get 8.8.8.8 2>/dev/null | awk '{print $7; exit}')
-WAN_IP=$(curl -sf --max-time 10 https://api.ipify.org 2>/dev/null || echo "unavailable")
+# Managed by 01-initial-setup.sh — writes local + WAN IP into /etc/issue.
+#
+# Ubuntu 26.04 broke the original one-liners:
+#   • iproute2 no longer guarantees "src" is field $7 (on-link routes, extra
+#     tokens, JSON-ish cache lines). Parse the "src" keyword instead.
+#   • curl is missing on server-cloud-minimal. Fall back to wget / python3.
+#   • network-online.target can fire before DHCP/UFW/DNS. Wait for a route.
+
+is_ipv4() { [[ "${1:-}" =~ ^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$ ]]; }
+
+wait_for_route() {
+    local i
+    for i in $(seq 1 30); do
+        ip -4 route show default 2>/dev/null | grep -q . && return 0
+        ip -4 route get 1.1.1.1 2>/dev/null | grep -q ' src ' && return 0
+        sleep 1
+    done
+    return 1
+}
+
+local_ip() {
+    local ip
+    # Keyword parse — works whether the line has "via" or is on-link.
+    ip=$(ip -4 route get 1.1.1.1 2>/dev/null | sed -n 's/.*src \([0-9.]\+\).*/\1/p' | head -1)
+    is_ipv4 "${ip}" && { echo "${ip}"; return; }
+    ip=$(ip -4 -o addr show scope global 2>/dev/null | awk '{print $4}' | cut -d/ -f1 | head -1)
+    is_ipv4 "${ip}" && { echo "${ip}"; return; }
+    ip=$(hostname -I 2>/dev/null | awk '{print $1}')
+    is_ipv4 "${ip}" && { echo "${ip}"; return; }
+    echo "unavailable"
+}
+
+http_get() {
+    local url="$1"
+    if command -v curl >/dev/null 2>&1; then
+        curl -4 -sf --max-time 8 --retry 2 --retry-delay 1 "${url}" && return 0
+    fi
+    if command -v wget >/dev/null 2>&1; then
+        wget -4 -q -O - --timeout=8 "${url}" && return 0
+    fi
+    if command -v python3 >/dev/null 2>&1; then
+        python3 -c "import urllib.request,sys; print(urllib.request.urlopen(sys.argv[1], timeout=8).read().decode().strip())" "${url}" && return 0
+    fi
+    return 1
+}
+
+wan_ip() {
+    local ip url
+    for url in \
+        https://api.ipify.org \
+        https://ifconfig.me/ip \
+        https://icanhazip.com
+    do
+        ip=$(http_get "${url}" 2>/dev/null | tr -d '[:space:]')
+        is_ipv4 "${ip}" && { echo "${ip}"; return; }
+    done
+    echo "unavailable"
+}
+
+wait_for_route || true
+LOCAL_IP=$(local_ip)
+WAN_IP=$(wan_ip)
+
 cat > /etc/issue << EOF
 Ubuntu \n \l
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-  Local IP  :  ${LOCAL_IP:-unavailable}
+  Local IP  :  ${LOCAL_IP}
   WAN IP    :  ${WAN_IP}
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 EOF
+
+# Non-zero if local is still missing so systemd can retry after DHCP lands.
+is_ipv4 "${LOCAL_IP}"
 BANNER_SCRIPT
 
 chmod +x /usr/local/bin/update-issue
@@ -636,13 +705,15 @@ chmod +x /usr/local/bin/update-issue
 cat > /etc/systemd/system/update-issue.service << 'EOF'
 [Unit]
 Description=Update login banner with local and WAN IP addresses
-After=network-online.target
+After=network-online.target ufw.service systemd-resolved.service
 Wants=network-online.target
 
 [Service]
 Type=oneshot
 ExecStart=/usr/local/bin/update-issue
 RemainAfterExit=yes
+Restart=on-failure
+RestartSec=15
 
 [Install]
 WantedBy=multi-user.target
@@ -650,7 +721,8 @@ EOF
 
 systemctl daemon-reload
 systemctl enable update-issue
-/usr/local/bin/update-issue
+# Run now so the current console is updated; failure is OK if the NIC is down.
+/usr/local/bin/update-issue || warn "Banner wrote 'unavailable' — it will retry on boot once the network is up."
 
 success "Login banner configured (/etc/issue updated on every boot)."
 
